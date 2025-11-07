@@ -1,5 +1,4 @@
-<link rel="stylesheet" href="./static/css/main.css">
-<div align="center">
+<link rel="stylesheet" href="{{ '/static/css/main.css' | relative_url }}"><div align="center">
 
 [English](README.en.md) | 简体中文
 
