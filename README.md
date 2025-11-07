@@ -1,18 +1,21 @@
 <div align="center">
-  [English](README.en.md) | 简体中文
-</div>
 
-<br>
+[English](README.en.md) | 简体中文
+
+<img src="./static/img/ApacheArrow.png" alt="Apache Arrow" style="width: 250px; height: 54px;">
+</div>
 
 <div align="center">
-  <img src="./static/img/ApacheArrow.png" alt="Apache Arrow" style="width: 250px; height: 54px;">
+<a href="https://scholar.google.com/citations?user=zfonu1kAAAAJ&hl=en">
+  <img src="./static/img/googlecholar.svg" alt="Google Scholar" width="20" />
+</a>
+<a href="https://orcid.org/my-orcid?orcid=0009-0003-2969-0551">
+  <img src="./static/img/orcid.svg" alt="Google Scholar" width="20" />
+</a>
+<a href="https://github.com/HuTaoJiaZiAckerman">
+  <img src="./static/img/github.svg" alt="Google Scholar" width="20" />
+</a>
 </div>
-
-<br>
-
-[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/arrow.svg)](https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:arrow)
-[![License](http://img.shields.io/:license-Apache%202-blue.svg)](https://github.com/apache/arrow/blob/main/LICENSE.txt)
-[![BlueSky Follow](https://img.shields.io/badge/bluesky-Follow-blue?logo=bluesky)](https://bsky.app/profile/arrow.apache.org)
 
 
 
