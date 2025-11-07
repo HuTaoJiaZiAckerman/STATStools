@@ -9,7 +9,7 @@
 <a href="https://scholar.google.com/citations?user=zfonu1kAAAAJ&hl=en">
   <img src="./static/img/googlecholar.svg" alt="Google Scholar" width="20" />
 </a>
-<a href="https://orcid.org/my-orcid?orcid=0009-0003-2969-0551">
+<a href="https://orcid.org/0009-0003-2969-0551">
   <img src="./static/img/orcid.svg" alt="Google Scholar" width="20" />
 </a>
 <a href="https://github.com/HuTaoJiaZiAckerman">
