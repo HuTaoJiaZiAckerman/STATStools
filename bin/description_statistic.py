@@ -1,1 +1,1 @@
-/home/mingh/project_1/kiz_code/02.父母等位基因效应/description_statistic.py
+/home/mingh/project_1/kiz_code/bin/description_statistic.py

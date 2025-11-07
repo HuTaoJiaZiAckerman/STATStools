@@ -1,1 +1,1 @@
-/home/mingh/project_1/kiz_code/01.表型解析/diff_test.py
+/home/mingh/project_1/kiz_code/bin/diff_test.py

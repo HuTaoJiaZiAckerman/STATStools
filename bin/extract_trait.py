@@ -1,1 +1,1 @@
-/home/mingh/project_1/kiz_code/01.表型解析/extract_trait.py
+/home/mingh/project_1/kiz_code/bin/extract_trait.py

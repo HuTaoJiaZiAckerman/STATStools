@@ -1,1 +1,1 @@
-/home/mingh/project_1/kiz_code/01.表型解析/saved_trait.py
+/home/mingh/project_1/kiz_code/bin/saved_trait.py

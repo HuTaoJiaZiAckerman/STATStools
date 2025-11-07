@@ -1,1 +1,1 @@
-/home/mingh/project_1/kiz_code/string_count.py
+/home/mingh/project_1/kiz_code/bin/string_count.py
