@@ -1,0 +1,1 @@
+/home/mingh/project_1/kiz_code/tools/show_parquet.py

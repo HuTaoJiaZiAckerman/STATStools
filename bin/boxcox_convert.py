@@ -1,0 +1,1 @@
+/home/mingh/project_1/kiz_code/02.父母等位基因效应/boxcox_convert.py
