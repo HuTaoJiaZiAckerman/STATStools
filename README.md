@@ -183,7 +183,7 @@ Github地址：[https://github.com/Achuan-2/SlideSCI](https://github.com/Achuan-
 
 累积赞赏50元的朋友如果想加我微信，可以发邮件到achuan-2@outlook.com来进行好友申请（赞赏达不到50元的，我不会回复邮件和加好友哦，因为不想当免费客服）
 
-<img alt="" src="https://s2.loli.net/2025/08/29/tI4HCGzql17nr2D.png" />
+<img alt="" src="" />
 
 ## 10 👨💻 问题反馈
 
