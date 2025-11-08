@@ -138,15 +138,15 @@ def main():
     statstools show_parquet -i input_file.parquet -n 10
     statstools description_statistic -i input_file.parquet -g windowa,origin -v effect_value -o ./output_file.parquet
 可用工具：
-    • show_parquet        - 查看parquet文件内容
-    • description_statistic - 描述性统计分析
-    • boxcox_convert      - Box-Cox转换
-    • filter_data         - 数据过滤
-    • diff_test           - 差异检验
-    • extract_trait       - 性状提取
-    • plot_normal         - 正态分布绘图
-    • saved_trait         - 保存性状数据
-    • string_count        - 字符串计数
+    • show_parquet              - 查看parquet文件内容
+    • description_statistic     - 描述性统计分析
+    • boxcox_convert            - Box-Cox转换
+    • filter_data               - 数据过滤
+    • diff_test                 - 差异检验
+    • extract_trait             - 性状提取
+    • plot_normal               - 正态分布绘图
+    • saved_trait               - 保存性状数据
+    • string_count              - 字符串计数
 """)
     # 将tool改为可选参数
     parser.add_argument('tool', nargs='?', help='要使用的工具名')
