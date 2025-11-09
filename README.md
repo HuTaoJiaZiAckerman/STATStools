@@ -42,3 +42,6 @@ pip install -e .
 
 查看说明书：
 `statstools -h`
+
+## 3. 帮助页面
+请查看[wiki](https://github.com/HuTaoJiaZiAckerman/STATStools/wiki)页面，已获得更多使用说明。
