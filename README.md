@@ -24,4 +24,21 @@
 首先查看工具列表：`statstools -h`，专为科学计算设计，全面处理 AppchrArrow的工具包，支持Bayes混合效应模型计算方差、组间方差、组内方差、可重复性（R=组间方差/组内方差）。
 
 举个例子：这个工具可以查看parquet格式的文件：`statstools show_parquet -i stat.parquet -n 10`
+
 <img alt="image" src="./static/img/statstools_show_parquet-h.png" style="width: 849px;" />​
+
+## 2. 安装说明
+
+首先克隆本项目到本地：
+其次创建conda环境；
+然后进入文件夹安装软件。
+```shell
+git clone git@github.com:HuTaoJiaZiAckerman/STATStools.git
+conda create -n statstools
+conda activate statstools
+cd STATStools
+pip install -e .
+```
+
+查看说明书：
+`statstools -h`
