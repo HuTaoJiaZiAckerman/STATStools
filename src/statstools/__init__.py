@@ -138,14 +138,18 @@ def main():
     statstools show_parquet -i input_file.parquet -n 10
     statstools description_statistic -i input_file.parquet -g windowa,origin -v effect_value -o ./output_file.parquet
 可用工具：
-    • show_parquet              - 查看parquet文件内容
-    • description_statistic     - 描述性统计分析
-    • boxcox_convert            - Box-Cox转换
-    • filter_data               - 数据过滤
-    • diff_test                 - 差异检验
-    • extract_trait             - 性状提取
+    • bayes_variance            - 计算方差（Bayes和ANOVA两种方法）
+    • boxcox_convert            - 数据的BoxCox 转换（正态性转换）
+    • concat_parquet            - 合并parquet格式文件（多个文件纵向合并，需要保证列数一致）
+    • convert_format            - 长数据格式转短数据格式
+    • description_statistic     - 对数据进行描述性统计分析
+    • diff_test                 - 两组差异性检验
+    • export_data               - 导出数据（MySQL导出到本地，并以parquet格式存储）
+    • extract_trait             - 提取性状（从某一列分别提取唯一值所在的行，并生成新的子集文件）
+    • filter_data               - 过滤数据（按照特定条件过滤数据）
     • plot_normal               - 正态分布绘图
     • saved_trait               - 保存性状数据
+    • show_parquet              - 展示parquet格式文件
     • string_count              - 字符串计数
 """)
     # 将tool改为可选参数
