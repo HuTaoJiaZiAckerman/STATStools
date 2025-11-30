@@ -1,4 +1,3 @@
-#! /home/mingh/miniconda3/envs/polars/bin/python
 # -*- coding: utf-8 -*-
 """
 # @FileName      : plot_normal

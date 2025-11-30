@@ -1,4 +1,3 @@
-#!/home/minghaocao/miniconda3/bin/python3
 # -*- coding: utf-8 -*-
 """
 # @FileName      : export_data

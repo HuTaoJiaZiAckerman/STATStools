@@ -43,6 +43,12 @@ def recomb_cal(data,count=578):
             (pl.col('p_count')/count*100).round(3).alias('p_rate'),
             (pl.col('m_count')/count*100).round(3).alias('m_rate')
         ])
+        .with_columns([
+            pl.when(pl.col('m_rate') == 0)
+            .then(0)
+            .otherwise(pl.col('p_rate') / pl.col('m_rate'))
+            .alias('rate')
+        ])
         .rename({'chr':'chra','window':'windowa'})
         .sort(['chra','windowa'])
     )
