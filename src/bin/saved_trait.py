@@ -14,19 +14,49 @@ import numpy as np
 import os
 # 定义函数：查询数据
 def query_func(uri,query,partition_on,partition_num=16):
-    data = cx.read_sql(conn=uri,query=query,partition_on=partition_on,partition_num=partition_num,return_type='polars',protocol='binary')
+    data = cx.read_sql(conn=uri,
+                       query=query,
+                       partition_on=partition_on,
+                       partition_num=partition_num,
+                       return_type='polars',
+                       protocol='binary')
     return data
 # 定义函数：基于数据观测值大小过滤性状
 def del_trait_by_size(data,col_group,min_count):
     data_count = data.group_by(pl.col(col_group)).agg(pl.len().alias('count'))
-    saved_trait_by_size_list = data_count.filter(pl.col('count') > min_count).select(col_group).to_numpy().flatten()
-    del_trait_by_size_list = data_count.filter(pl.col('count') < min_count).select(col_group).to_numpy().flatten()
+    saved_trait_by_size_list = (data_count
+                                .filter(pl.col('count') > min_count)
+                                .select(col_group)
+                                .to_numpy()
+                                .flatten())
+    del_trait_by_size_list = (data_count
+                              .filter(pl.col('count') < min_count)
+                              .select(col_group)
+                              .to_numpy()
+                              .flatten())
     return saved_trait_by_size_list, del_trait_by_size_list
 # 定义函数：基于数据离散型过滤性状
 def del_trait_by_discontinuous(data,col_group,col_value,min_count):
-    data_continuous = data.group_by(col_group).agg(pl.col(col_value).unique().count().alias('unique_count'),pl.col(col_group).count().alias('total_count')).with_columns((pl.col('unique_count') / pl.col('total_count') * 100).alias('ratio'))
-    saved_trait_by_continuous_list = data_continuous.filter(pl.col('ratio') > min_count).select(pl.col(col_group)).to_numpy().flatten()
-    del_trait_by_continuous_list = data_continuous.filter(pl.col('ratio') < min_count).select(pl.col(col_group)).to_numpy().flatten()
+    data_continuous = (data
+                       .group_by(col_group)
+                       .agg(pl.col(col_value)
+                            .unique()
+                            .count()
+                            .alias('unique_count'),
+                            pl.col(col_group)
+                            .count()
+                            .alias('total_count'))
+                        .with_columns((pl.col('unique_count') / pl.col('total_count') * 100).alias('ratio')))
+    saved_trait_by_continuous_list = (data_continuous
+                                      .filter(pl.col('ratio') > min_count)
+                                      .select(pl.col(col_group))
+                                      .to_numpy()
+                                      .flatten())
+    del_trait_by_continuous_list = (data_continuous
+                                    .filter(pl.col('ratio') < min_count)
+                                    .select(pl.col(col_group))
+                                    .to_numpy()
+                                    .flatten())
     return saved_trait_by_continuous_list, del_trait_by_continuous_list
 # 定义函数：最终输出结果，基于观测数量过滤的结果，基于离散型过滤的结果
 def final_res(data,col_group,del_trait_by_size_list,del_trait_by_discontinuous):
@@ -40,7 +70,6 @@ def saved_func(data,output_path):
         output_path = os.path.join(output_path, 'query.parquet')
     # 确保输出目录是存在的
     os.makedirs(os.path.dirname(output_path),exist_ok=True)
-
     data.write_parquet(output_path)
     return print(f'Have done! File saved as: {output_path}')
 # 定义函数：主函数
