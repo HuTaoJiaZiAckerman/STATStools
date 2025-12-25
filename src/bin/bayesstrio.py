@@ -1,19 +1,11 @@
-#!/home/minghaocao/miniconda3/bin/python3
-# -*- coding:utf-8 -*- 
-"""
-# File Name: bayesstrio.py
-# Author: caomh
-# Created Time: 09:54  2025-12-17
-
-"""
 # -*- coding: utf-8 -*-
 """
 BayesSTrio：计算选择强度，贝叶斯多层混合稀疏模型（NumPyro + JAX 版）
 作者：minghaocao / xiehaibing7
 更新：整合亲本特异性选择模式（稳定 vs 分散）
+第三版本的调整是针对模型设计：提升有效样本量
 """
-
-
+# 1.1 导入程序需要的Python 模块
 import os
 import argparse
 import time
@@ -23,16 +15,18 @@ import numpy as np
 import polars as pl
 import pandas as pd
 
-# 必须在导入 numpyro 前配置 JAX
+
+# 2. 必须在导入 numpyro 前配置 JAX
 jax.config.update("jax_platform_name", "cpu")  # 强制 CPU（避免无 GPU 报错）
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"  # 模拟 4 个设备用于 parallel chains
 
+# 1.2 导入程序需要的Python 模块第二部分
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 from numpyro.diagnostics import summary as numpyro_summary
 
-# 禁用警告（可选）
+# 1.3 禁用警告（可选）
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -47,67 +41,52 @@ def load_file(input_file, chrom_id, window_id):
 
 
 # ============================
-# 2. NumPyro 贝叶斯稀疏模型（亲本特异性）
+# 2. NumPyro 贝叶斯稀疏模型（亲本特异性 + 窗口级 S_k, E_k）
 # ============================
 def bayesian_sparse_model(y, w, origin="maternal"):
-    """
-    Spike-and-Slab 贝叶斯稀疏模型 with parent-of-origin specific variance scaling.
-    
-    Parameters:
-        y: trait_male_diff (表型效应, shape [N], >0)
-        w: malecount_diff (适合度效应, shape [N])
-        origin: "maternal" or "paternal"
-    """
-    N = y.shape[0]
+    M = y.shape[0]
 
-    # Step 1: 稀疏比例 π ~ Beta(1, 1) ≡ Uniform(0,1)
-    pi = numpyro.sample("pi", dist.Beta(1.0, 1.0))
-    
-    # Step 2: 全局选择强度 S ~ HalfCauchy(0, 1)
-    S = numpyro.sample("S", dist.HalfCauchy(scale=1.0))
-    
-    # Step 3: 缩放敏感度 λ > 0
-    lambda_ = numpyro.sample("lambda", dist.Gamma(1.0, 1.0))  # prior: Gamma(1,1)
-    
-    # Step 4: 观测噪声 σ_w ~ HalfCauchy(1.0)
-    sigma_w = numpyro.sample("sigma_w", dist.HalfCauchy(scale=1.0))
+    # 全局超参数
+    tau_E = numpyro.sample("tau_E", dist.HalfCauchy(1.0))
+    lambda_ = numpyro.sample("lambda", dist.Gamma(2.0, 4.0))
+    sigma_w = numpyro.sample("sigma_w", dist.HalfNormal(1.0))
 
-    # Step 5: 计算方差缩放函数 f(y_i)
-    if origin == "maternal":
-        f_y = jnp.exp(-lambda_ * y)      # stabilizing selection
-    elif origin == "paternal":
-        f_y = jnp.exp(+lambda_ * y)      # disruptive selection
-    else:
-        raise ValueError("origin must be 'maternal' or 'paternal'")
-    
-    # Local slab variance: V_i = 0.5 * S * f(y_i)
-    # 因为 p = 0.5 → 2p(1-p) = 0.5
-    V_i = 0.5 * S * f_y   # shape: [N]
+    # (a) 选择强度 S ∈ (-1, 1)
+    S_logit = numpyro.sample("S_logit", dist.Normal(0.0, 1.0))
+    S = numpyro.deterministic("S", jnp.tanh(S_logit))  # ∈ (-1,1)
 
-    # Step 6: Spike-and-slab per SNP
-    with numpyro.plate("snps", N):
-        gamma = numpyro.sample("gamma", dist.Bernoulli(probs=pi))
-        # Slab: beta_slab_i ~ Normal(0, sqrt(V_i))
-        beta_slab = numpyro.sample("beta_slab", dist.Normal(0.0, jnp.sqrt(V_i)))
-        beta = gamma * beta_slab
-        # Likelihood
-        numpyro.sample("w_obs", dist.Normal(beta, sigma_w), obs=w)
+    # (b) 上位性指数 E ≥ 0
+    E = numpyro.sample("E", dist.HalfNormal(tau_E))
 
+    # (c) 响应函数
+    # 在 response 计算前加裁剪
+    log_response = -lambda_ * y * E if origin == "maternal" else +lambda_ * y * E
+    log_response = jnp.clip(log_response, -10, 10)  # 防止 exp 溢出
+    response = jnp.exp(log_response)
+
+    # (d) 线性效应：S * response
+    mu = S * response  # shape (M,)
+
+    # (e) 观测模型
+    with numpyro.plate("records", M):
+        numpyro.sample("w_obs", dist.Normal(mu, sigma_w), obs=w)
 
 # ============================
 # 3. 运行 MCMC 并生成 summary
 # ============================
-def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin,  chrom_id=None):
+def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin, chrom_id=None):
+    # 定义变量：表型效应、等位基因频率效应
     y_col = f'trait_male_diff_{suffix}'
     w_col = f'malecount_diff_{suffix}'
-    
+    # 保险起见，还是要检查一下定义的y_col是不是在输入的数据框里面
     if y_col not in df.columns or w_col not in df.columns:
         raise KeyError(f"Columns {y_col} or {w_col} not found in input data.")
-    
+    # 导入输入向量，也就是一列表型值改变、一列等位基因频率改变
     y = df[y_col].values.astype(np.float32)
     w = df[w_col].values.astype(np.float32)
-
-    # Ensure y > 0 (as assumed)
+    w_mean, w_std = np.mean(w), np.std(w)
+    w = (w - w_mean) / (w_std + 1e-6)
+    # 确保 y > 0 (因为确保指数函数的符号： exp(±λ y E))
     if np.any(y <= 0):
         print("⚠️ Warning: Some y <= 0. Clipping to small positive value.")
         y = np.clip(y, 1e-6, None)
@@ -115,20 +94,17 @@ def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin, 
     y_jax = jnp.array(y)
     w_jax = jnp.array(w)
 
-    def conditioned_model():
-        return bayesian_sparse_model(y_jax, w_jax, origin=origin)
-
+    # ✅ 正确方式：直接传入模型 + 数据（无需 wrapper）
     nuts_kernel = NUTS(
-        conditioned_model,
+        bayesian_sparse_model,
         target_accept_prob=0.95,
         max_tree_depth=10,
         adapt_step_size=True,
         adapt_mass_matrix=True,
     )
-
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=2000,
+        num_warmup=2000,      # 可适当减少（4000 太多，除非收敛慢）
         num_samples=2000,
         num_chains=4,
         chain_method="parallel",
@@ -136,125 +112,52 @@ def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin, 
     )
 
     rng_key = jax.random.PRNGKey(int(time.time()) % (2**32))
-    mcmc.run(rng_key)
+    # ✅ 关键：将数据作为 model 的参数传入
+    mcmc.run(rng_key, y_jax, w_jax, origin=origin)
 
     samples = mcmc.get_samples()
-    summary_dict = numpyro_summary(samples, group_by_chain=False)
+    summary_dict = numpyro.diagnostics.summary(samples, group_by_chain=False)
 
     # ----------------------------
-    #直接使用传入的 chrom_id 和 window_id（均为 int）
+    # 提取窗口级参数（标量！）
     # ----------------------------
-    chra = chrom_id  # ← 直接传入
-    windowa = window_id  # ← 直接传入
+    chra = chrom_id
+    windowa = window_id
 
-    # ----------------------------
-    # 构建完整 summary 表（仅用于内部提取）
-    # ----------------------------
-    summary_rows = []
-    index_names = []
+    # 我们只关心：S, E, gamma, pi, lambda, sigma_w
+    target_vars = ["S", "E", "lambda", "sigma_w", "tau_E"]
 
-    for var_name, stats in summary_dict.items():
-        mean_val = stats["mean"]
-        std_val = stats["std"]
-        hdi_5 = stats["5.0%"]
-        hdi_95 = stats["95.0%"]
-        n_eff = stats.get("n_eff", np.nan)
-        r_hat = stats.get("r_hat", np.nan)
+    hyper_data = {
+        "chra": chra,
+        "windowa": windowa,
+        "trait_id": trait_id
+    }
 
-        if np.isscalar(mean_val) or (hasattr(mean_val, 'ndim') and mean_val.ndim == 0):
-            row = {
-                "variable": var_name,
-                "index": -1,
-                "mean": float(mean_val),
-                "sd": float(std_val),
-                "hdi_5%": float(hdi_5),
-                "hdi_95%": float(hdi_95),
-                "ess_bulk": float(n_eff),
-                "r_hat": float(r_hat),
-                "significant": False,
-            }
-            summary_rows.append(row)
-            index_names.append(var_name)
+    for var in target_vars:
+        if var in summary_dict:
+            stats = summary_dict[var]
+            hyper_data[f"{var}_mean"] = float(stats["mean"])
+            hyper_data[f"{var}_sd"] = float(stats["std"])
+            hyper_data[f"{var}_hdi_5%"] = float(stats["5.0%"])
+            hyper_data[f"{var}_hdi_95%"] = float(stats["95.0%"])
+            hyper_data[f"{var}_ess_bulk"] = float(stats.get("n_eff", np.nan))
+            hyper_data[f"{var}_r_hat"] = float(stats.get("r_hat", np.nan))
         else:
-            size = mean_val.shape[0]
-            n_eff_arr = np.full(size, n_eff) if np.isscalar(n_eff) or (hasattr(n_eff, 'ndim') and n_eff.ndim == 0) else n_eff
-            r_hat_arr = np.full(size, r_hat) if np.isscalar(r_hat) or (hasattr(r_hat, 'ndim') and r_hat.ndim == 0) else r_hat
+            # 填充 NaN（理论上不会发生）
+            for suffix_key in ["_mean", "_sd", "_hdi_5%", "_hdi_95%", "_ess_bulk", "_r_hat"]:
+                hyper_data[f"{var}{suffix_key}"] = np.nan
 
-            for i in range(size):
-                row = {
-                    "variable": var_name,
-                    "index": i,
-                    "mean": float(mean_val[i]),
-                    "sd": float(std_val[i]),
-                    "hdi_5%": float(hdi_5[i]),
-                    "hdi_95%": float(hdi_95[i]),
-                    "ess_bulk": float(n_eff_arr[i]),
-                    "r_hat": float(r_hat_arr[i]),
-                    "significant": False,
-                }
-                summary_rows.append(row)
-                index_names.append(f"{var_name}[{i}]")
+    # 判断该窗口是否显著受选择
 
-    summary_df = pd.DataFrame(summary_rows, index=index_names)
-
-    # ----------------------------
-    # 标记显著 beta_slab
-    # ----------------------------
-    beta_mask = summary_df['variable'] == 'beta_slab'
-    summary_df.loc[beta_mask, 'significant'] = (
-        (summary_df.loc[beta_mask, 'hdi_5%'] > 0) |
-        (summary_df.loc[beta_mask, 'hdi_95%'] < 0)
-    )
-
-    # ----------------------------
-    # 表 1: 超参数表（含完整诊断信息）
-    # ----------------------------
-    scalar_vars = ['S', 'pi', 'sigma_w', 'lambda']
-    hyper_data = {"chra": chra, "windowa": windowa, "trait_id": trait_id}
-
-    for var in scalar_vars:
-        if var in summary_df.index:
-            hyper_data[f"{var}_mean"]      = summary_df.loc[var, "mean"]
-            hyper_data[f"{var}_r_hat"]     = summary_df.loc[var, "r_hat"]
-            hyper_data[f"{var}_ess_bulk"]  = summary_df.loc[var, "ess_bulk"]
-        else:
-            hyper_data[f"{var}_mean"]      = np.nan
-            hyper_data[f"{var}_r_hat"]     = np.nan
-            hyper_data[f"{var}_ess_bulk"]  = np.nan
-
+    S_samples = np.asarray(samples["S"])  # 显式转为 numpy array
+    threshold = 0.1
+    P_selected = np.mean(np.abs(S_samples) > threshold)
+    hyper_data["P_selected"] = float(P_selected)
+    hyper_data["is_selected"] = P_selected > 0.95
     hyperparameters_df = pd.DataFrame([hyper_data])
 
-    # ----------------------------
-    # 表 2: beta_slab 表
-    # ----------------------------
-    beta_slab_df = summary_df[summary_df['variable'] == 'beta_slab'].copy()
+    return hyperparameters_df
 
-    if not beta_slab_df.empty:
-        beta_slab_df = beta_slab_df.rename(columns={
-            "mean": "selection_coefficient_S_mean",
-            "sd": "selection_coefficient_S_sd"
-        })
-        beta_slab_df["chra"] = chra
-        beta_slab_df["windowa"] = windowa
-        beta_slab_df["trait_id"] = trait_id
-
-        # 选择所需列并排序
-        cols_order = [
-            "chra", "windowa", "trait_id", "index",
-            "selection_coefficient_S_mean", "selection_coefficient_S_sd",
-            "hdi_5%", "hdi_95%", "ess_bulk", "r_hat", "significant"
-        ]
-        beta_slab_df = beta_slab_df[cols_order].reset_index(drop=True)
-    else:
-        # 若无 beta_slab，返回空表但带正确结构
-        empty_data = {col: [] for col in [
-            "chra", "windowa", "trait_id", "index",
-            "selection_coefficient_S_mean", "selection_coefficient_S_sd",
-            "hdi_5%", "hdi_95%", "ess_bulk", "r_hat", "significant"
-        ]}
-        beta_slab_df = pd.DataFrame(empty_data)
-
-    return hyperparameters_df, beta_slab_df
 
 # 导入染色体坐标文件
 def load_chromosome_coordinate(chromosom_dictionary_path):
@@ -317,7 +220,7 @@ def main():
             df_pd = data.to_pandas()
 
             # Run model — 注意：现在传入 chrom_id 和 window_id
-            hyperparameters_df, beta_slab_df = run_bayesian_model_jax(
+            hyperparameters_df = run_bayesian_model_jax(
                 df_pd,
                 trait_id=trait_id,
                 suffix=suffix,
@@ -334,10 +237,6 @@ def main():
             hyperparameters_df.to_parquet(hyper_file, index=False)
             print(f"✅ Saved hyperparameters to {hyper_file}")
 
-            # Save beta_slab (per-mutation effects)
-            beta_file = os.path.join(output_path, f"beta_slab_{file_prefix}.parquet")
-            beta_slab_df.to_parquet(beta_file, index=False)
-            print(f"✅ Saved beta_slab results to {beta_file}")
 
         except Exception as e:
             print(f"❌ Error: {e}")

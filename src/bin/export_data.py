@@ -36,6 +36,10 @@ def down_load_file(conn_uri,query,output_path,partition_on,partition_num):
         batch_size=50000,
         protocol='binary'
         )
+    # ✅ 新增：自动创建输出文件的父目录
+    output_dir = os.path.dirname(output_path)
+    if output_dir:  # 防止 output_path 是当前目录（如 "file.parquet"）
+        os.makedirs(output_dir, exist_ok=True)
     data.write_parquet(output_path)
     end_time = time.time()
     print(f'导出数据耗时：{end_time - start_time:.2f} 秒。')
