@@ -6,7 +6,6 @@
 # @Email         : minghaocao@yeah.net
 # @description   : 
 """
-
 import os
 import argparse
 import jax
@@ -16,7 +15,6 @@ import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 import polars as pl
 import numpy as np
-
 def configure_jax():
     """集中配置JAX参数"""
     jax.config.update('jax_platform_name', 'cpu')
@@ -114,8 +112,8 @@ def bayesian_mixed_model_jax(gdf, group_variant, pheno_value):
     
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=2000,
-        num_samples=2000,
+        num_warmup=1000,
+        num_samples=1000,
         num_chains=4,  # 使用4个 CPU 核心，就是4条MCMC链同时进行
         chain_method='parallel',  # 改为 parallel 以更好地利用多核
         progress_bar=True
@@ -195,11 +193,10 @@ def main():
 
     parser.add_argument('-i','--input_file_path',required=True,help = '输入文件路径')
     parser.add_argument('-o','--output_file_path',required=True,help='输出文件路径')
-    #parser.add_argument('-chrom_num','--chrom_num',type=int,required=True,help='染色体号')
-    parser.add_argument('-chrom_num', '--chrom_num', type=int, required=False, help='（可选）指定染色体号，若不提供则处理所有染色体')
-    parser.add_argument('-chrom_dict','--chrom_dict_path',required=True,help='染色体坐标文件路径')
-    parser.add_argument('-group','--group_variant',required=True,help='文件中的分组变量，用于计算组间方差')
-    parser.add_argument('-value','--value_name',required=True,help='观测值')
+    parser.add_argument('-t','--total_chrom_count',type=int,required=True,help='请输入该物种全部染色体计数；例如，猪有18条常染色体，输入-t 18')
+    parser.add_argument('-d','--chrom_dict_path',required=True,help='请输入染色体坐标文件路径；例如，')
+    parser.add_argument('-g','--group_variant',required=True,help='文件中的分组变量，用于计算组间方差')
+    parser.add_argument('-v','--value_name',required=True,help='观测值')
 
     args=parser.parse_args()
 
@@ -212,51 +209,53 @@ def main():
     except Exception as e:
         print(f'读取字典失败: {e}')
         return
-    # 确定要处理的染色体列表
-    if args.chrom_num is not None:
-        chroms_to_process = [args.chrom_num]
-    else:
-        # 默认处理字典中所有染色体（按顺序）
-        chroms_to_process = sorted(chrom_dict.keys())
+    
 
-    # 2.
-    results = []
-    for chrom in chroms_to_process:
+    # 2. 计算部分
+    # 2.1 读入所有染色体数
+    total_chrom_count = range(1,args.total_chrom_count + 1)
+    # 2.2 执行循环
+    for chrom in total_chrom_count:
+        # 2.2.1 定义一个空列表，用于存储结果
+        results = []
+        # 2.2.2 基于染色体号，从字典中读取每条染色体对应的窗口数
         total_window = chrom_dict[chrom]
-        print(f"=== 开始处理染色体 {chrom}，共 {total_window} 个窗口 ===")
-        for window in range(total_window):  # 注意：窗口从 0 开始，与你的数据一致
-            print(f'  处理染色体 {chrom} 的窗口 {window + 1}/{total_window}')
+        # 3. 获取trait_id
+        trait_id = os.path.basename(args.input_file_path).split('_')[3]
+
+        for window in range(0,total_window):
+            # 1. 打印运行到此处的提示信息，证明程序处理到那个位置了
+            print(f'正在处理染色体：{chrom} 的第  {window}/{total_window} 个窗口。')
+            # 2. 导入当前窗口的数据
             try:
                 data = load_boxcox_data(args.input_file_path, chrom, window)
-                if data.is_empty():
-                    print(f'    警告：染色体 {chrom} 窗口 {window} 无数据，跳过。')
-                    continue
-                result = bayesian_mixed_model_jax(data, args.group_variant, args.value_name)
-                results.append(result)
             except Exception as e:
-                print(f'    计算失败（染色体 {chrom}, 窗口 {window}）: {e}')
+                print(f'读取文件失败： {e}')
                 continue
 
-    # 5.合并并保存结果
-    if results:
-        try:
-            final_result = pl.concat(results)
-            print(f'正在保存结果到: {args.output_file_path}...')
-            save_parquet(final_result, args.output_file_path)
-            print('结果保存成功！')
-        except Exception as e:
-            print(f'文件保存失败：{e}')
-    else:
-        print('没有有效结果可保存')
-    
-    #使用参数
-    print(f"""
-    接收到的参数：\n
-    输入文件路径是:{args.input_file_path}。 \n
-    输出文件路径是：{args.output_file_path}。 \n
-    染色体坐标文件路径是：{args.chrom_dict_path}。 \n
-    用于分组的变量是：{args.group_variant}。 \n
-    用于计算的变量是：{args.value_name}。 
-    """)
+
+            # 4. 计算当前窗口的方差
+            try:
+                result = bayesian_mixed_model_jax(data,args.group_variant,args.value_name)
+                results.append(result)
+            except Exception as e:
+                print(f'计算失败:{e}')
+                continue
+        # 2.2.3 合并并保存结果
+        if results:
+            try:
+                final_result = pl.concat(results)
+                final_file_name = f"bayes_variance_{chrom}_allwindow_{trait_id}.parquet"
+                saved_path = os.path.join(args.output_file_path,final_file_name)
+                print(f'正在保存结果到: {saved_path}...')
+                save_parquet(final_result, saved_path)
+                print('结果保存成功！')
+            except Exception as e:
+                print(f'文件保存失败：{e}')
+        else:
+            print('没有有效结果可保存')
+
+
+
 if __name__ == "__main__":
     main()

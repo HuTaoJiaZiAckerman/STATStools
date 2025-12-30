@@ -33,7 +33,7 @@ def down_load_file(conn_uri,query,output_path,partition_on,partition_num):
         return_type='polars',
         partition_on=partition_on,
         partition_num=partition_num,
-        batch_size=50000,
+        #batch_size=50000,
         protocol='binary'
         )
     # ✅ 新增：自动创建输出文件的父目录
