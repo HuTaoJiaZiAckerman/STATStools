@@ -2,7 +2,10 @@
 
 [English](README.en.md) | 简体中文
 
+<img alt="image" src="./static/img/STATStools_mark.png" style="width: 200px;" />​
+
 <img src="./static/img/ApacheArrow.png" alt="Apache Arrow" style="width: 250px; height: 54px;">
+
 </div>
 
 <div align="center">
@@ -29,9 +32,9 @@
 
 ## 2. 安装说明
 
-首先克隆本项目到本地：
-其次创建conda环境；
-然后进入文件夹安装软件。
+* 首先克隆本项目到本地：
+* 其次创建conda环境；
+* 然后进入文件夹安装软件。
 ```shell
 git clone git@github.com:HuTaoJiaZiAckerman/STATStools.git
 conda create -n statstools
@@ -39,9 +42,18 @@ conda activate statstools
 cd STATStools
 pip install -e .
 ```
-
+* 还得安装辅助 `Python` 模块
+```
+pip install connectorx
+pip install polars
+pip install jax
+pip install numpyro
+```
 查看说明书：
 `statstools -h`
 
 ## 3. 帮助页面
 请查看[wiki](https://github.com/HuTaoJiaZiAckerman/STATStools/wiki)页面，已获得更多使用说明。
+
+## 4. 联系我
+`xueshengcaominghao@163.com` 或者 `caominghao@kiz.mail.ac.cn` 。
