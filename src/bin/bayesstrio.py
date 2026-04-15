@@ -1,11 +1,18 @@
-# -*- coding: utf-8 -*-
+#! /public/home/xiehaibing7/.conda/envs/ipython/bin/python3.13
+# -*- coding:utf-8 -*-
 """
-BayesSTrio：计算选择强度，贝叶斯多层混合稀疏模型（NumPyro + JAX 版）
-作者：minghaocao / xiehaibing7
-更新：整合亲本特异性选择模式（稳定 vs 分散）
-第三版本的调整是针对模型设计：提升有效样本量
+# File Name: bayesstrio_jax_v9.py
+# Author: caomh
+# Created Time: 2026-3-15
+# Version: v8
+# 核心改进：
+# 增加Hierarchical，新增τ_E；
+# 先验全部对齐 BayesS 风格；
+# 稀疏通过 S 的后验阈值实现，保留亲本特异性；
+# 修复随机状态：rng_key；
+# 把参数 λ 和 超参数 τ_E 进行约束，因为Cauchy会拖慢随机采样过程；
+# 将输入数据进行Yeo-John convert之后再输入模型，以评估E S 
 """
-# 1.1 导入程序需要的Python 模块
 import os
 import argparse
 import time
@@ -15,125 +22,137 @@ import numpy as np
 import polars as pl
 import pandas as pd
 
+# ==================== JAX 配置 ====================
+jax.config.update("jax_platform_name", "cpu")
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
 
-# 2. 必须在导入 numpyro 前配置 JAX
-jax.config.update("jax_platform_name", "cpu")  # 强制 CPU（避免无 GPU 报错）
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"  # 模拟 4 个设备用于 parallel chains
-
-# 1.2 导入程序需要的Python 模块第二部分
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 from numpyro.diagnostics import summary as numpyro_summary
-
-# 1.3 禁用警告（可选）
 import warnings
 warnings.filterwarnings("ignore")
 
 # ============================
-# 1. 读取文件
+# 1. 从大文件中提取当前窗口 + origin 的子集
 # ============================
-def load_file(input_file, chrom_id, window_id):
-    data = pl.scan_parquet(input_file).filter(
-        (pl.col('chra') == chrom_id) & (pl.col('windowa') == window_id)
-    ).collect()
-    return data
-
-
+def load_window_subset(full_df: pl.DataFrame, chrom_id: int, window_id: int, origin: str) -> pl.DataFrame:
+    """
+    从已经加载的完整文件中过滤出指定 chr、window、origin 的数据
+    """
+    subset = full_df.filter(
+        (pl.col("chra") == chrom_id) &
+        (pl.col("windowa") == window_id) &
+        (pl.col("origin") == origin)
+    )
+    return subset
 # ============================
-# 2. NumPyro 贝叶斯稀疏模型（亲本特异性 + 窗口级 S_k, E_k）
+# 2. BayesSTrio v8 核心模型（与 BayesS 高度对齐）
 # ============================
 def bayesian_sparse_model(y, w, origin="maternal"):
     M = y.shape[0]
 
-    # 全局超参数
-    tau_E = numpyro.sample("tau_E", dist.HalfCauchy(1.0))
-    lambda_ = numpyro.sample("lambda", dist.Gamma(2.0, 4.0))
-    sigma_w = numpyro.sample("sigma_w", dist.HalfNormal(1.0))
-
-    # (a) 选择强度 S ∈ (-1, 1)
+    # === 参数层（直接推断）===
     S_logit = numpyro.sample("S_logit", dist.Normal(0.0, 1.0))
-    S = numpyro.deterministic("S", jnp.tanh(S_logit))  # ∈ (-1,1)
+    S = numpyro.deterministic("S", jnp.tanh(S_logit))          # 选择强度
 
-    # (b) 上位性指数 E ≥ 0
-    E = numpyro.sample("E", dist.HalfNormal(tau_E))
+    #E = numpyro.sample("E", dist.HalfNormal(1.0))              # 上位性强度（v6默认尺度1，τ_E 已隐含）
+    #tau_E = numpyro.sample("tau_E", dist.HalfCauchy(1.0))      # 上位性强度 （v7升级，不在使用固定尺度，而是引入τ_E，τ_E是Cauchy分布，容易卡死MCMC链）
+    log_tau_E = numpyro.sample("log_tau_E", dist.Normal(0.0, 1.0))
+    tau_E = numpyro.deterministic("tau_E", jnp.exp(log_tau_E))
+    E = numpyro.sample("E", dist.HalfNormal(tau_E))             # 上位性强度（v8升级，τ_E 也reparameterize）
+    E = jnp.clip(E, 1e-6, 20.0)
+    #lambda_ = numpyro.sample("lambda", dist.HalfCauchy(1.0))   # 响应缩放系数（v6 关键升级）
+    log_lambda = numpyro.sample("log_lambda", dist.Normal(0.0, 1.0))
+    lambda_ = numpyro.deterministic("lambda", jnp.exp(log_lambda)) # 响应缩放系数（v7 关键升级）
+    sigma_w = numpyro.sample("sigma_w", dist.HalfNormal(1.0))  # 噪声
+    sigma_w = jnp.clip(sigma_w, 0.1, 10.0)                       # v8 新增，约束sigma
 
-    # (c) 响应函数
-    # 在 response 计算前加裁剪
-    log_response = -lambda_ * y * E if origin == "maternal" else +lambda_ * y * E
-    log_response = jnp.clip(log_response, -10, 10)  # 防止 exp 溢出
+    # === 响应函数（保留你的亲本特异性 + E 上位性）===
+    sign = -1.0 if origin == "maternal" else 1.0
+    log_response = sign * lambda_ * y * E
+    log_response = jnp.clip(log_response, -10.0, 10.0)
     response = jnp.exp(log_response)
 
-    # (d) 线性效应：S * response
-    mu = S * response  # shape (M,)
+    mu = S * response
 
-    # (e) 观测模型
+    # === 似然层 ===
     with numpyro.plate("records", M):
         numpyro.sample("w_obs", dist.Normal(mu, sigma_w), obs=w)
 
 # ============================
-# 3. 运行 MCMC 并生成 summary
+# 3. 运行 MCMC（保持原结构，增加 v8 注释）
 # ============================
-def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin, chrom_id=None):
-    # 定义变量：表型效应、等位基因频率效应
-    y_col = f'trait_male_diff_{suffix}'
-    w_col = f'malecount_diff_{suffix}'
-    # 保险起见，还是要检查一下定义的y_col是不是在输入的数据框里面
-    if y_col not in df.columns or w_col not in df.columns:
-        raise KeyError(f"Columns {y_col} or {w_col} not found in input data.")
-    # 导入输入向量，也就是一列表型值改变、一列等位基因频率改变
-    y = df[y_col].values.astype(np.float32)
-    w = df[w_col].values.astype(np.float32)
+def run_bayesian_model_jax(df: pl.DataFrame, trait_id: int, suffix: str, window_id: int, output_dir: str, origin: str, chrom_id: int = None):
+    # 现在 df 已经是当前窗口 + origin 的子集了（polars DataFrame）
+
+    if df.is_empty():
+        print(f"窗口 {window_id} 数据为空，跳过")
+        return None
+    
+    # 转换为 pandas 只在必要时做（效率考虑）
+    df_pd = df.to_pandas()
+    # y 使用 Yeo-Johnson 转换后的列
+    y = df_pd["trait_value_yj"].values.astype(np.float32) # v9 新增
+    
+    # w 使用 trait_count（你的新数据里叫这个）
+    w = df_pd["trait_count"].values.astype(np.float32) # v9 新增
+
+    # 标准化 w（保持原逻辑）
     w_mean, w_std = np.mean(w), np.std(w)
     w = (w - w_mean) / (w_std + 1e-6)
-    # 确保 y > 0 (因为确保指数函数的符号： exp(±λ y E))
-    if np.any(y <= 0):
-        print("⚠️ Warning: Some y <= 0. Clipping to small positive value.")
-        y = np.clip(y, 1e-6, None)
+
+    # y 现在已经是转换后的，通常不需要 clip，但可以保留轻量保护
+    # 如果你想再标准化 y，也可以在这里加（推荐）
+    # y = (y - np.mean(y)) / (np.std(y) + 1e-6)
 
     y_jax = jnp.array(y)
     w_jax = jnp.array(w)
 
-    # ✅ 正确方式：直接传入模型 + 数据（无需 wrapper）
+
     nuts_kernel = NUTS(
-        bayesian_sparse_model,
-        target_accept_prob=0.95,
-        max_tree_depth=10,
+        bayesian_sparse_model, 
+        target_accept_prob=0.95, 
+        max_tree_depth=8,             # ← 从 10 改到 8（速度翻倍）
         adapt_step_size=True,
         adapt_mass_matrix=True,
-    )
+        init_strategy=numpyro.infer.init_to_median(num_samples=100))
     mcmc = MCMC(
-        nuts_kernel,
-        num_warmup=2000,      # 可适当减少（4000 太多，除非收敛慢）
-        num_samples=2000,
+        nuts_kernel, 
+        num_warmup=1000, 
+        num_samples=1000, 
         num_chains=4,
-        chain_method="parallel",
-        progress_bar=True,
-    )
+        chain_method="parallel", 
+        progress_bar=False)
 
-    rng_key = jax.random.PRNGKey(int(time.time()) % (2**32))
-    # ✅ 关键：将数据作为 model 的参数传入
+    #rng_key = jax.random.PRNGKey(int(time.time()) % (2**32)) # v7设计：完全随机的种子，但是缺点就是不一定能重复出来，审稿人可能要问
+    rng_key = jax.random.PRNGKey(42 + window_id)   # v8升级：每个窗口自动不同，避免完全相同初始化
     mcmc.run(rng_key, y_jax, w_jax, origin=origin)
 
     samples = mcmc.get_samples()
     summary_dict = numpyro.diagnostics.summary(samples, group_by_chain=False)
 
-    # ----------------------------
-    # 提取窗口级参数（标量！）
-    # ----------------------------
-    chra = chrom_id
-    windowa = window_id
+    # ==================== 新增：r_hat 质量控制 ====================
+    max_rhat = 0.0
+    for var in summary_dict:
+        rhat = summary_dict[var].get("r_hat", 1.0)
+        if rhat > max_rhat:
+            max_rhat = rhat
 
-    # 我们只关心：S, E, gamma, pi, lambda, sigma_w
-    target_vars = ["S", "E", "lambda", "sigma_w", "tau_E"]
-
+    if max_rhat > 1.01:
+        print(f"⚠️ 窗口 {window_id} r_hat={max_rhat:.4f} > 1.01，质量不合格，跳过保存！")
+        return None  # ← 直接返回 None，不生成文件
+    
+    
+    # === 提取窗口级参数 ===
     hyper_data = {
-        "chra": chra,
-        "windowa": windowa,
-        "trait_id": trait_id
+        "chra": chrom_id,
+        "windowa": window_id,
+        "trait_id": trait_id,
+        "origin": origin
     }
 
-    for var in target_vars:
+    for var in ["S", "E", "lambda", "sigma_w"]:
         if var in summary_dict:
             stats = summary_dict[var]
             hyper_data[f"{var}_mean"] = float(stats["mean"])
@@ -142,113 +161,89 @@ def run_bayesian_model_jax(df, trait_id, suffix, window_id, output_dir, origin, 
             hyper_data[f"{var}_hdi_95%"] = float(stats["95.0%"])
             hyper_data[f"{var}_ess_bulk"] = float(stats.get("n_eff", np.nan))
             hyper_data[f"{var}_r_hat"] = float(stats.get("r_hat", np.nan))
-        else:
-            # 填充 NaN（理论上不会发生）
-            for suffix_key in ["_mean", "_sd", "_hdi_5%", "_hdi_95%", "_ess_bulk", "_r_hat"]:
-                hyper_data[f"{var}{suffix_key}"] = np.nan
 
-    # 判断该窗口是否显著受选择
-
-    S_samples = np.asarray(samples["S"])  # 显式转为 numpy array
-    threshold = 0.1
-    P_selected = np.mean(np.abs(S_samples) > threshold)
+    # === 稀疏判定（BayesSTrio 的稀疏机制）===
+    S_samples = np.asarray(samples["S"])
+    P_selected = np.mean(np.abs(S_samples) > 0.1)
     hyper_data["P_selected"] = float(P_selected)
     hyper_data["is_selected"] = P_selected > 0.95
-    hyperparameters_df = pd.DataFrame([hyper_data])
 
+    hyperparameters_df = pd.DataFrame([hyper_data])
     return hyperparameters_df
 
-
-# 导入染色体坐标文件
+# ============================
+# 4. 染色体字典 & 主函数（保持不变，仅更新文件名）
+# ============================
 def load_chromosome_coordinate(chromosom_dictionary_path):
-    """
-    坐标文件格式为txt，有多少染色体就有多少行，共两个字段第一列为染色体号，第二列为染色体窗口数（1MB）。
-    """
     chrom_dict = {}
     with open(chromosom_dictionary_path) as f:
         for line in f:
             parts = line.strip().split()
             if len(parts) == 2:
-                chrom,window = parts
+                chrom, window = parts
                 chrom_dict[int(chrom)] = int(window)
     return chrom_dict
 
-# ============================
-# 4. 主函数
-# ============================
 def main():
-    parser = argparse.ArgumentParser(description='BayesSTrio：计算选择强度，贝叶斯多层混合稀疏模型（JAX加速版）')
-    parser.add_argument('-i','--input_file', required=True, help='输入文件路径')
-    parser.add_argument('-dict','--chrom_dict_path',required=True,help='请输入染色体字段路径')
-    parser.add_argument('-o','--output_path', required=True, help='输出目录路径')
-    parser.add_argument('-t','--trait', required=True, help='性状ID')
-    parser.add_argument('-c','--chrom_id', required=True, type=int, help='染色体编号')
-    parser.add_argument('-origin','--origin', required=True, choices=['M','P'], help='亲本来源（P=父源, M=母源）')
+    parser = argparse.ArgumentParser(description='BayesSTrio v9：使用 Yeo-Johnson 转换数据')
+    parser.add_argument('-i', '--input_file', required=True, help="YJ转换后的完整 parquet 文件")
+    parser.add_argument('-dict', '--chrom_dict_path', required=True)
+    parser.add_argument('-o', '--output_path', required=True)
+    parser.add_argument('-t', '--trait', required=True, type=int)
+    parser.add_argument('-c', '--chrom_id', required=True, type=int)
+    parser.add_argument('-origin', '--origin', required=True, choices=['M','P'])
     args = parser.parse_args()
-    # 1. 定义参数
+
     trait_id = args.trait
     chrom_id = args.chrom_id
     input_file = args.input_file
     origin_flag = args.origin
     output_path = args.output_path
     os.makedirs(output_path, exist_ok=True)
-    # 2. 读取字典
-    try:
-        chrom_dict = load_chromosome_coordinate(args.chrom_dict_path)
-        print(f'成功读取字典: {args.chrom_dict_path}')
-    except Exception as e:
-        print(f'读取字典失败: {e}')
-        return
-    # 3. 定义循环数（基于参数，染色体号，定义哪条染色体有多少个窗口） 
-    total_window = chrom_dict[args.chrom_id]
 
-    # 4. 基于输入参数（亲本来源），判断Map origin flag to string
     origin = "maternal" if origin_flag == "M" else "paternal"
-    suffix = origin  # because columns are named ..._maternal / ..._paternal
+    suffix = origin
 
-    # 5. 循环处理
-    for window_id in range(0,total_window):
-        # 加载数据
-        data = load_file(input_file, chrom_id, window_id)
-        print(f"正在处理目标窗口: 性状{trait_id}_第{chrom_id}号染色体的第{window_id}个窗口……")
+    # ★★★ 关键改动：一次性加载整个大文件 ★★★
+    print(f"正在加载完整文件: {input_file} ...")
+    full_df = pl.scan_parquet(input_file).collect()
+    print(f"文件加载完成，总行数: {len(full_df):,}")
 
-        try:
-            if data.is_empty():
-                print(f"⚠️ No data found for chr{chrom_id}, window {window_id}")
-                continue
+    # 只保留当前 trait_id 的数据（加速后续过滤）
+    full_df = full_df.filter(pl.col("trait_id") == trait_id)
 
-            df_pd = data.to_pandas()
+    chrom_dict = load_chromosome_coordinate(args.chrom_dict_path)
+    total_window = chrom_dict.get(chrom_id, 0)
 
-            # Run model — 注意：现在传入 chrom_id 和 window_id
-            hyperparameters_df = run_bayesian_model_jax(
-                df_pd,
-                trait_id=trait_id,
-                suffix=suffix,
-                window_id=window_id,      # 仍然是整数
-                output_dir=output_path,
-                origin=origin,
-                chrom_id=chrom_id        # ← 新增参数
-            )
-            # 构建文件名前缀
-            file_prefix = f"result_chrom{chrom_id}_window{window_id}_trait{trait_id}_{suffix}"
+    if total_window == 0:
+        print(f"染色体 {chrom_id} 在字典中未找到或窗口数为0，退出")
+        return
+    
+    for window_id in range(total_window):
+        start_time = time.time()
+        print(f"正在处理：性状{trait_id}_chr{chrom_id}_window{window_id}（{origin}） - 开始时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # Save hyperparameters (scalar)
-            hyper_file = os.path.join(output_path, f"hyper_{file_prefix}.parquet")
-            hyperparameters_df.to_parquet(hyper_file, index=False)
-            print(f"✅ Saved hyperparameters to {hyper_file}")
+        # 从大表中切出当前窗口 + origin 的子集
+        data = load_window_subset(full_df, chrom_id, window_id, origin_flag)  # 注意这里用 origin_flag 'P'/'M'
 
-
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
+        if data.is_empty():
+            print(f"窗口 {window_id} 无数据，跳过")
             continue
 
-        print(f"\n🎉 性状{trait_id}_第{chrom_id}号染色体的第{window_id}个窗口 已经做完了!")
-    return 0
+        hyperparameters_df = run_bayesian_model_jax(
+            data, trait_id, suffix, window_id, output_path, origin, chrom_id
+        )
 
-# ============================
-# 5. 入口
-# ============================
+        if hyperparameters_df is not None:
+            file_prefix = f"result_chrom{chrom_id}_window{window_id}_trait{trait_id}_{suffix}"
+            hyper_file = os.path.join(output_path, f"hyper_{file_prefix}_v9.parquet")  # 可以改成 v9
+            hyperparameters_df.to_parquet(hyper_file, index=False)
+            print(f"✅ Saved v9 result: {hyper_file}")
+        
+        elapsed = time.time() - start_time
+        print(f"窗口 {window_id} 完成，用时 {elapsed:.1f} 秒")
+
+    print("🎉 BayesSTrio v8 全染色体处理完成！")
+
 if __name__ == '__main__':
     main()
