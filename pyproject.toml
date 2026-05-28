@@ -43,6 +43,6 @@ dev = [
 statstools = "statstools:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/statstools"
-Repository = "https://github.com/yourusername/statstools"
-Issues = "https://github.com/yourusername/statstools/issues"
+Homepage = "https://github.com/HuTaoJiaZiAckerman/statstools"
+Repository = "https://github.com/HuTaoJiaZiAckerman/statstools"
+Issues = "https://github.com/HuTaoJiaZiAckerman/statstools/issues"
