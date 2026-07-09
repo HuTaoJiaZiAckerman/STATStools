@@ -1,68 +1,167 @@
 #! /public/home/xiehaibing7/.conda/envs/ipython/bin/python3.13
 # -*- coding: utf-8 -*-
 """
-# @FileName      : bayes_variance_v5.2.py
-# @description   : 优化MCMC参数 + 修复接受概率获取 + 减少采样数提高效率
-# @changes       : 1. target_accept_prob: 0.95 -> 0.85
-#                  2. num_warmup: 1000 -> 400, num_samples: 1000 -> 400
-#                  3. 修复mean_accept_prob获取逻辑
+# File Name: bayes_variance_vend.py
+# Author: minghaocao 
+# Created Time: 2026-6-28
+# Version: vend
+# 
+# 部署版本 - 严格过滤，精简输出，支持多字段批量计算
+# 
+# 核心计算（ANOVA + Bayes方差）
+# 
+# 核心模型：
+#   1. ANOVA 计算组间/组内方差和重复性
+#   2. 贝叶斯层次模型计算方差分量（sd_alpha, sd_error）
+#   3. 输出包含 R_hat 和 ESS 收敛诊断
+# 
+# 变更：
+#   1. 固定 MCMC 参数（chains=4, warmup=2000, samples=2000）
+#   2. R_hat > 1.01 的窗口不保存结果
+#   3. 输出包含 n_samples，不包含 converged 和 n_groups
+#   4. 输入方式：按 trait_id + chrom_id + window_id 过滤
+#   5. 输出方式：每个窗口独立保存为 hyper_*.parquet
+#   6. 提交粒度：每个 (trait_id, chrom_id) 作为一个任务
+#   7. 支持 -v 指定多个数值列批量计算
+#   8. 支持 -g 指定分组列名（如 group_variant）
+#   9. 输出文件命名: hyper_chr{chrom}_win{window}_trait{trait}.parquet
 """
 
 import os
 import argparse
-import json
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import polars as pl
+import pandas as pd
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
 from numpyro.diagnostics import gelman_rubin as potential_scale_reduction, effective_sample_size
-import polars as pl
-import numpy as np
 
-# ========== 配置（修复并行死锁）==========
+
+# ==================== JAX 配置 ====================
 def configure_jax():
-    """配置JAX避免并行死锁"""
-    jax.config.update('jax_platform_name', 'cpu')
-    
-    # 关键：设置正确的CPU设备数量，避免fork问题
-    cpu_count = os.cpu_count()
-    # 限制每个进程使用的CPU核心数，避免过度竞争
-    os.environ['XLA_FLAGS'] = f'--xla_force_host_platform_device_count={min(4, cpu_count)}'
-    
-    # 避免JAX在fork时出现问题
-    os.environ['JAX_ENABLE_X64'] = 'True'  # 使用float64提高精度
-    
-    print("JAX running on:", jax.devices())
-    print('Node CPU count: ', cpu_count)
-    print('JAX device count: ', len(jax.devices()))
+    """配置JAX环境"""
+    jax.config.update("jax_platform_name", "cpu")
+    cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', '4'))
+    os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={cpus}"
+    print(f"JAX devices: {cpus}")
 
-# ========== ANOVA ==========
-def anova_gpu_jax(y_jax, groups_jax):
+
+# ============================
+# 1. 从大文件中提取当前窗口的子集（不再按 origin 过滤）
+# ============================
+def load_window_subset(full_df: pl.DataFrame, chrom_id: int, window_id: int) -> pl.DataFrame:
+    """
+    从完整数据中提取指定窗口的子集
+    
+    Parameters:
+    -----------
+    full_df : pl.DataFrame
+        完整数据
+    chrom_id : int
+        染色体号
+    window_id : int
+        窗口号
+    
+    Returns:
+    --------
+    pl.DataFrame
+        过滤后的数据子集（包含所有 origin）
+    """
+    subset = full_df.filter(
+        (pl.col("chra") == chrom_id) &
+        (pl.col("windowa") == window_id)
+    )
+    return subset
+
+
+# ============================
+# 2. 加载染色体字典
+# ============================
+def load_chromosome_coordinate(chromosom_dictionary_path):
+    """加载染色体-窗口数映射字典"""
+    chrom_dict = {}
+    with open(chromosom_dictionary_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                chrom, window = parts
+                chrom_dict[int(chrom)] = int(window)
+    return chrom_dict
+
+
+# ============================
+# 3. 核心模型（ANOVA）
+# ============================
+
+# ---------- 3.1 ANOVA 模型 ----------
+def anova_gpu_jax(y_jax: jnp.ndarray, groups_jax: jnp.ndarray, min_samples_per_group: int = 2):
+    """
+    ANOVA 方差分析（JAX实现）
+    
+    Parameters:
+    -----------
+    y_jax : jnp.ndarray
+        标准化后的表型值
+    groups_jax : jnp.ndarray
+        分组标签
+    min_samples_per_group : int
+        每组最小样本数要求
+    
+    Returns:
+    --------
+    dict
+        包含方差分量和F值
+    """
     unique_groups = jnp.unique(groups_jax)
+    
+    # ====== 检查每组样本数是否满足要求 ======
+    for g in unique_groups:
+        count = jnp.sum(groups_jax == g)
+        if count < min_samples_per_group:
+            return {
+                "sigma_alpha_sq": jnp.nan,
+                "sigma_epsilon_sq": jnp.nan,
+                "repeatability": jnp.nan,
+                "f_value": jnp.nan,
+            }
+    
     group_means = jnp.array([jnp.mean(y_jax[groups_jax == g]) for g in unique_groups])
     global_mean = jnp.mean(y_jax)
     group_sizes = jnp.array([jnp.sum(groups_jax == g) for g in unique_groups])
+    
     ssb = jnp.sum(group_sizes * (group_means - global_mean) ** 2)
     ssw = jnp.sum((y_jax - group_means[groups_jax]) ** 2)
+    
     k = len(unique_groups)
     N = len(y_jax)
     df_between = k - 1
     df_within = N - k
+    
+    # ====== 防止除零错误 ======
+    if df_between == 0 or df_within == 0:
+        return {
+            "sigma_alpha_sq": jnp.nan,
+            "sigma_epsilon_sq": jnp.nan,
+            "repeatability": jnp.nan,
+            "f_value": jnp.nan,
+        }
+    
     msb = ssb / df_between
     msw = ssw / df_within
     f_value = msb / msw
+    
     n_per_group = N / k
     sigma_alpha_sq = jnp.maximum((msb - msw) / n_per_group, 0.0)
     sigma_epsilon_sq = msw
     repeatability = sigma_alpha_sq / (sigma_alpha_sq + sigma_epsilon_sq)
+    
     return {
         "sigma_alpha_sq": float(sigma_alpha_sq),
         "sigma_epsilon_sq": float(sigma_epsilon_sq),
@@ -70,64 +169,163 @@ def anova_gpu_jax(y_jax, groups_jax):
         "f_value": float(f_value),
     }
 
-# ========== 贝叶斯模型（优化版）==========
-def bayesian_mixed_model_jax(gdf: pl.DataFrame, group_variant: str, 
-                            pheno_value: str, trait_name: str = None):
-    mapping = {"P": 0, "M": 1}
-    groups = gdf[group_variant].replace(mapping).cast(pl.Int32).to_numpy()
-    y = gdf[pheno_value].to_numpy()
+
+# ============================
+# 4. 运行 MCMC（方差版本）- 固定参数，支持单字段
+# ============================
+def run_bayesian_variance_jax(df: pl.DataFrame, trait_id: int, window_id: int,
+                              chrom_id: int = None,
+                              group_col: str = "origin",
+                              value_col: str = "trait_value",
+                              subsample_ratio: float = 0.1):
+    """
+    运行贝叶斯方差模型 - 10% 采样优化版
     
-    if np.any(np.isnan(y)):
-        valid_idx = ~np.isnan(y)
+    固定配置：
+        n_chains = 4
+        n_warmup = 2000
+        n_samples = 2000
+        target_accept_prob = 0.99
+    """
+    if df.is_empty():
+        print(f"窗口 {window_id} 数据为空，跳过")
+        return None
+    
+    # ====== 提取输入数据 ======
+    df_pd = df.to_pandas()
+    
+    # 检查列是否存在
+    if group_col not in df_pd.columns:
+        print(f"  ❌ 分组列 '{group_col}' 不存在！")
+        return None
+    
+    if value_col not in df_pd.columns:
+        print(f"  ❌ 数值列 '{value_col}' 不存在！")
+        return None
+    
+    # ====== 更安全的分组变量提取 ======
+    # 确保只保留 P 和 M 两种分组
+    df_filtered = df_pd[df_pd[group_col].isin(["P", "M"])].copy()
+    
+    if len(df_filtered) == 0:
+        print(f"  ⚠️ 窗口 {window_id} 没有有效的 P/M 分组数据")
+        return None
+    
+    original_size = len(df_filtered)
+    
+    # ============================================================
+    # ✅ 采样：对 df_filtered 进行采样
+    # ============================================================
+    if subsample_ratio < 1.0:
+        # 分层采样，保持 P/M 比例
+        df_p = df_filtered[df_filtered[group_col] == "P"]
+        df_m = df_filtered[df_filtered[group_col] == "M"]
+        
+        p_sample = df_p.sample(frac=subsample_ratio, random_state=42)
+        m_sample = df_m.sample(frac=subsample_ratio, random_state=42)
+        df_filtered = pd.concat([p_sample, m_sample], ignore_index=True)  # ✅ 更新 df_filtered
+        
+        print(f"  📊 采样 {subsample_ratio:.0%}: {len(df_filtered):,} 行 (原始 {original_size:,})")
+    else:
+        print(f"  📊 使用全部数据: {original_size} 行")
+    
+    # ====== 从 df_filtered 提取数据 ======
+    groups = df_filtered[group_col].map({"P": 0, "M": 1}).values.astype(np.int32)
+    y = df_filtered[value_col].values.astype(np.float32)
+    
+    # 去除 y 中的缺失值
+    valid_idx = ~np.isnan(y)
+    if not np.all(valid_idx):
         y = y[valid_idx]
         groups = groups[valid_idx]
     
     if len(y) == 0:
-        raise ValueError(f"{pheno_value} 无有效数据")
+        print(f"窗口 {window_id} 无有效数据")
+        return None
     
-    y_mean, y_std = np.mean(y), np.std(y)
-    y_normalized = (y - y_mean) / y_std
+    # 检查分组情况
+    unique_groups = np.unique(groups)
+    n_groups = len(unique_groups)
+    
+    if n_groups < 2:
+        print(f"  ⚠️ 窗口 {window_id} 只有 {n_groups} 个组 ({unique_groups})，无法计算方差")
+        return None
+    
+    # 检查每组样本数
+    for g in unique_groups:
+        count = np.sum(groups == g)
+        if count < 2:
+            print(f"  ⚠️ 窗口 {window_id} 分组 {g} 只有 {count} 个样本，需要至少2个")
+            return None
+    
+    # ====== 标准化（使用 float32） ======
+    y_mean = np.mean(y).astype(np.float32)
+    y_std = np.std(y).astype(np.float32)
+    
+    if y_std == 0:
+        print(f"  ⚠️ 窗口 {window_id} 的数值列 {value_col} 所有值相同")
+        return None
+    
+    y_normalized = ((y - y_mean) / y_std).astype(np.float32)
     
     y_jax = jnp.array(y_normalized, dtype=jnp.float32)
     groups_jax = jnp.array(groups, dtype=jnp.int32)
     
+    # ====== 计算 ANOVA ======
     anova_results = anova_gpu_jax(y_jax, groups_jax)
-    n_groups = len(np.unique(groups))
+    anova_valid = not np.isnan(anova_results["sigma_alpha_sq"])
     
-    def model(y=None, groups=None):
-        sd_alpha = numpyro.sample("sd_alpha", dist.HalfNormal(0.5))
-        sd_error = numpyro.sample("sd_error", dist.HalfNormal(0.5))
-        mu = numpyro.sample("mu", dist.Normal(0, 0.5))
+    if anova_valid:
+        anova_sigma_alpha_sq_original = anova_results["sigma_alpha_sq"] * (y_std ** 2)
+        anova_sigma_epsilon_sq_original = anova_results["sigma_epsilon_sq"] * (y_std ** 2)
+    else:
+        print(f"  ⚠️ 窗口 {window_id} ANOVA 计算结果无效，将仅保存贝叶斯结果")
+        anova_sigma_alpha_sq_original = np.nan
+        anova_sigma_epsilon_sq_original = np.nan
+    
+    # ============================================================
+    # 定义模型（使用闭包捕获 n_groups）
+    # ============================================================
+    def bayesian_variance_model(y, groups):
+        sd_alpha = numpyro.sample("sd_alpha", dist.HalfCauchy(1.0))
+        sd_error = numpyro.sample("sd_error", dist.HalfCauchy(1.0))
+        mu = numpyro.sample("mu", dist.Normal(0, 1.0))
+        
         with numpyro.plate("plate_groups", n_groups):
-            alpha_raw = numpyro.sample("alpha_raw", dist.Normal(0, 1))
-            alpha = sd_alpha * alpha_raw
+            alpha = numpyro.sample("alpha", dist.Normal(0, sd_alpha))
+        
         y_pred = mu + alpha[groups]
         numpyro.sample("obs", dist.Normal(y_pred, sd_error), obs=y)
     
-    # ========== 优化后的MCMC配置 ==========
+    # ====== 配置 NUTS ======
     nuts_kernel = NUTS(
-        model,
-        target_accept_prob=0.85,      # 从0.95降低到0.85，提高采样效率
-        max_tree_depth=9,
+        bayesian_variance_model,
+        target_accept_prob=0.99,
+        max_tree_depth=10,
         adapt_step_size=True,
-        adapt_mass_matrix=True
+        adapt_mass_matrix=True,
+        dense_mass=False,
+        init_strategy=numpyro.infer.init_to_median(num_samples=50)
     )
     
+    # ====== MCMC 配置 ======
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=400,               # 从1000降低到400
-        num_samples=400,              # 从1000降低到400
+        num_warmup=2000,
+        num_samples=2000,
         num_chains=4,
-        chain_method='parallel',
+        chain_method="parallel",
         progress_bar=False,
-        jit_model_args=True
+        jit_model_args=True,
     )
     
-    # 运行模型
-    rng_key = jax.random.PRNGKey(hash(trait_name) % 2**32 if trait_name else 42)
+    # ====== 运行 MCMC ======
+    rng_key = jax.random.PRNGKey(42 + window_id)
     mcmc.run(rng_key, y=y_jax, groups=groups_jax)
     
+    # ====== 提取后验样本 ======
     samples = mcmc.get_samples()
+    
     sigma_alpha = float(jnp.mean(samples["sd_alpha"])) * y_std
     sigma_error = float(jnp.mean(samples["sd_error"])) * y_std
     
@@ -135,10 +333,7 @@ def bayesian_mixed_model_jax(gdf: pl.DataFrame, group_variant: str,
     bayes_sigma_epsilon_sq = sigma_error ** 2
     bayes_repeatability = bayes_sigma_alpha_sq / (bayes_sigma_alpha_sq + bayes_sigma_epsilon_sq)
     
-    anova_sigma_alpha_sq_original = anova_results["sigma_alpha_sq"] * (y_std ** 2)
-    anova_sigma_epsilon_sq_original = anova_results["sigma_epsilon_sq"] * (y_std ** 2)
-    
-    # ========== 计算R_hat和ESS ==========
+    # ====== 收敛诊断 ======
     r_hat_sd_alpha = np.nan
     r_hat_sd_error = np.nan
     r_hat_mu = np.nan
@@ -147,317 +342,215 @@ def bayesian_mixed_model_jax(gdf: pl.DataFrame, group_variant: str,
     ess_sd_error = np.nan
     ess_mu = np.nan
     ess_mean = np.nan
-    mean_accept_prob = np.nan
     
     try:
-        # 获取分链样本
         samples_chain = mcmc.get_samples(group_by_chain=True)
-        
-        # 逐个参数计算R_hat和ESS
-        r_hat_dict = {}
-        ess_dict = {}
+        r_hat_values = {}
+        ess_values = {}
         
         for param_name in ['sd_alpha', 'sd_error', 'mu']:
             if param_name in samples_chain:
-                # samples_chain[param_name] 的形状是 [num_chains, num_samples]
                 param_samples = samples_chain[param_name]
                 
-                # 计算R_hat
                 r_hat_val = potential_scale_reduction(param_samples)
-                r_hat_dict[param_name] = float(r_hat_val.item()) if hasattr(r_hat_val, 'item') else float(r_hat_val)
+                r_hat_values[param_name] = float(r_hat_val.item()) if hasattr(r_hat_val, 'item') else float(r_hat_val)
                 
-                # 计算ESS
                 ess_val = effective_sample_size(param_samples)
-                ess_dict[param_name] = float(ess_val.item()) if hasattr(ess_val, 'item') else float(ess_val)
+                ess_values[param_name] = float(ess_val.item()) if hasattr(ess_val, 'item') else float(ess_val)
         
-        # 提取R_hat值
-        r_hat_sd_alpha = r_hat_dict.get('sd_alpha', np.nan)
-        r_hat_sd_error = r_hat_dict.get('sd_error', np.nan)
-        r_hat_mu = r_hat_dict.get('mu', np.nan)
+        r_hat_sd_alpha = r_hat_values.get('sd_alpha', np.nan)
+        r_hat_sd_error = r_hat_values.get('sd_error', np.nan)
+        r_hat_mu = r_hat_values.get('mu', np.nan)
         
-        # 计算平均R_hat
-        r_hat_values = [v for v in r_hat_dict.values() if not np.isnan(v)]
-        r_hat_mean = float(np.mean(r_hat_values)) if r_hat_values else np.nan
+        r_hat_vals = [v for v in r_hat_values.values() if not np.isnan(v)]
+        r_hat_mean = float(np.mean(r_hat_vals)) if r_hat_vals else np.nan
         
-        # 提取ESS值
-        ess_sd_alpha = ess_dict.get('sd_alpha', np.nan)
-        ess_sd_error = ess_dict.get('sd_error', np.nan)
-        ess_mu = ess_dict.get('mu', np.nan)
+        ess_sd_alpha = ess_values.get('sd_alpha', np.nan)
+        ess_sd_error = ess_values.get('sd_error', np.nan)
+        ess_mu = ess_values.get('mu', np.nan)
         
-        # 计算平均ESS
-        ess_values = [v for v in ess_dict.values() if not np.isnan(v)]
-        ess_mean = float(np.mean(ess_values)) if ess_values else np.nan
+        ess_vals = [v for v in ess_values.values() if not np.isnan(v)]
+        ess_mean = float(np.mean(ess_vals)) if ess_vals else np.nan
         
     except Exception as e:
         print(f"  诊断计算警告: {e}")
     
-    # ========== 修复：正确获取平均接受概率 ==========
-    try:
-        # 方法1：直接从mcmc的后验诊断中获取
-        if hasattr(mcmc, '_last_accept_prob'):
-            # 获取最后一步的接受概率
-            accept_probs = mcmc._last_accept_prob
-            if hasattr(accept_probs, 'mean'):
-                mean_accept_prob = float(accept_probs.mean())
-            elif hasattr(accept_probs, '__len__'):
-                mean_accept_prob = float(np.mean(accept_probs))
-            else:
-                mean_accept_prob = float(accept_probs)
-        
-        # 方法2：如果没有_last_accept_prob，尝试从采样器中获取
-        elif hasattr(mcmc, '_sampler') and hasattr(mcmc._sampler, '_kernel'):
-            kernel = mcmc._sampler._kernel
-            if hasattr(kernel, '_adapt_state') and hasattr(kernel._adapt_state, 'accept_prob'):
-                accept_probs = kernel._adapt_state.accept_prob
-                if hasattr(accept_probs, 'mean'):
-                    mean_accept_prob = float(accept_probs.mean())
-                elif hasattr(accept_probs, '__len__'):
-                    mean_accept_prob = float(np.mean(accept_probs))
-                else:
-                    mean_accept_prob = float(accept_probs)
-        
-        # 方法3：使用numpyro内置的获取方法
-        elif hasattr(mcmc, 'get_acceptance_rate'):
-            mean_accept_prob = float(mcmc.get_acceptance_rate())
-        
-        # 如果仍然失败，记录为NaN并警告
-        else:
-            print(f"  警告: 无法获取接受概率")
-            
-    except Exception as e:
-        print(f"  获取接受概率时出错: {e}")
-        mean_accept_prob = np.nan
+    # ====== 严格过滤：仅当贝叶斯收敛时才保存 ======
+    if not np.isnan(r_hat_mean) and r_hat_mean > 1.01:
+        print(f"  ❌ 窗口 {window_id} r_hat={r_hat_mean:.4f} > 1.01，丢弃结果！")
+        return None
     
-    return {
-        'trait_id': trait_name if trait_name else pheno_value,
-        'anova_sigma_alpha_sq': anova_sigma_alpha_sq_original,
-        'anova_sigma_epsilon_sq': anova_sigma_epsilon_sq_original,
-        'anova_repeatability': anova_results["repeatability"],
-        'anova_f_value': anova_results["f_value"],
-        'bayes_sigma_alpha_sq': bayes_sigma_alpha_sq,
-        'bayes_sigma_epsilon_sq': bayes_sigma_epsilon_sq,
-        'bayes_repeatability': bayes_repeatability,
-        'r_hat_sd_alpha': r_hat_sd_alpha,
-        'r_hat_sd_error': r_hat_sd_error,
-        'r_hat_mu': r_hat_mu,
-        'r_hat_mean': r_hat_mean,
-        'ess_sd_alpha': ess_sd_alpha,
-        'ess_sd_error': ess_sd_error,
-        'ess_mu': ess_mu,
-        'ess_mean': ess_mean,
-        'mean_accept_prob': mean_accept_prob,
+    # ====== 组装结果 ======
+    result_data = {
+        "chra": chrom_id,
+        "windowa": window_id,
+        "trait_id": trait_id,
+        "value_col": value_col,
+        "anova_sigma_alpha_sq": anova_sigma_alpha_sq_original,
+        "anova_sigma_epsilon_sq": anova_sigma_epsilon_sq_original,
+        "anova_repeatability": anova_results["repeatability"] if anova_valid else np.nan,
+        "anova_f_value": anova_results["f_value"] if anova_valid else np.nan,
+        "bayes_sigma_alpha_sq": bayes_sigma_alpha_sq,
+        "bayes_sigma_epsilon_sq": bayes_sigma_epsilon_sq,
+        "bayes_repeatability": bayes_repeatability,
+        "r_hat_sd_alpha": r_hat_sd_alpha,
+        "r_hat_sd_error": r_hat_sd_error,
+        "r_hat_mu": r_hat_mu,
+        "r_hat_mean": r_hat_mean,
+        "ess_sd_alpha": ess_sd_alpha,
+        "ess_sd_error": ess_sd_error,
+        "ess_mu": ess_mu,
+        "ess_mean": ess_mean,
+        "n_samples": len(y),
+        "n_groups": n_groups,
+        "original_size": original_size,
+        "anova_valid": anova_valid,
+        "subsample_ratio": subsample_ratio,  # ✅ 新增：记录采样比例
     }
-
-# ========== 数据加载 ==========
-def load_boxcox_data(input_file_path, chrom_num, window):
-    df = pl.scan_parquet(input_file_path).filter(
-        (pl.col('chra') == chrom_num) & (pl.col('windowa') == window)
-    ).collect()
-    return df
-
-def load_chromosome_coordinate(path):
-    chrom_dict = {}
-    with open(path) as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) == 2:
-                chrom_dict[int(parts[0])] = int(parts[1])
-    return chrom_dict
-
-# ========== 进度跟踪 ==========
-class SimpleProgress:
-    def __init__(self, window_dir, srr_id):
-        self.progress_file = window_dir / f"progress_{srr_id}.json"
-        self.completed = set()
-        if self.progress_file.exists():
-            try:
-                with open(self.progress_file, 'r') as f:
-                    data = json.load(f)
-                    self.completed = set(data.get('completed', []))
-            except:
-                pass
     
-    def is_completed(self, chrom, window):
-        key = f"{chrom}_{window}"
-        return key in self.completed
-    
-    def mark_completed(self, chrom, window):
-        key = f"{chrom}_{window}"
-        self.completed.add(key)
-        with open(self.progress_file, 'w') as f:
-            json.dump({'completed': list(self.completed)}, f, indent=2)
+    return pd.DataFrame([result_data])
 
-# ========== 主函数 ==========
+
+# ============================
+# 5. 主函数
+# ============================
 def main():
-    parser = argparse.ArgumentParser(description='贝叶斯方差分析 - 优化版 (v5.2)')
-    parser.add_argument('-i', '--input_file_path', required=True)
-    parser.add_argument('-o', '--output_file_path', required=True)
-    parser.add_argument('-t', '--total_chrom_count', type=int, required=True)
-    parser.add_argument('-d', '--chrom_dict_path', required=True)
-    parser.add_argument('-g', '--group_variant', required=True)
-    parser.add_argument('-v', '--value_names', required=True, nargs='+')
-    parser.add_argument('-s', '--srr_id', required=True, help='样本ID')
-    parser.add_argument('--separate_output', action='store_true', 
-                       help='兼容参数，V5.2默认每个窗口单独保存')
-    parser.add_argument('--resume', action='store_true', default=True,
-                       help='兼容参数，V5.2默认启用断点续传')
+    parser = argparse.ArgumentParser(description='Bayes Variance vend (ANOVA + Bayes)')
+    parser.add_argument('-i', '--input_file', required=True, help='输入 Parquet 文件路径')
+    parser.add_argument('-dict', '--chrom_dict_path', required=True, help='染色体字典文件路径')
+    parser.add_argument('-o', '--output_path', required=True, help='输出目录')
+    parser.add_argument('-t', '--trait', required=True, type=int, help='性状ID')
+    parser.add_argument('-c', '--chrom_id', required=True, type=int, help='染色体号')
+    parser.add_argument('-g', '--group_col', default='group_variant', 
+                        help='分组列名 (默认: group_variant)')
+    parser.add_argument('-v', '--value_names', required=True, nargs='+',
+                        help='要计算的数值列名列表，如: trait_value trait_count delta_pheno')
     
     args = parser.parse_args()
     
-    output_dir = Path(args.output_file_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 创建窗口结果目录
-    window_dir = output_dir / f"window_results_{args.srr_id}"
-    window_dir.mkdir(exist_ok=True)
-    
     configure_jax()
     
-    print(f"\n{'='*60}")
-    print(f"样本: {args.srr_id}")
-    print(f"输出目录: {window_dir}")
-    print(f"字段: {args.value_names}")
-    print(f"MCMC配置: warmup=400, samples=400, chains=4, parallel")
-    print(f"target_accept_prob=0.85 (优化版)")
-    print(f"{'='*60}\n")
+    trait_id = args.trait
+    chrom_id = args.chrom_id
+    input_file = args.input_file
+    output_path = args.output_path
+    group_col = args.group_col
+    value_names = args.value_names
+    
+    os.makedirs(output_path, exist_ok=True)
+    
+    print(f"正在加载完整文件: {input_file} ...")
+    full_df = pl.scan_parquet(input_file).collect()
+    print(f"文件加载完成，总行数: {len(full_df):,}")
+    
+    # 按 trait_id 过滤
+    full_df = full_df.filter(pl.col("trait_id") == trait_id)
+    print(f"过滤后 trait_id={trait_id}，行数: {len(full_df):,}")
+    
+    # 检查分组列是否存在
+    if group_col not in full_df.columns:
+        print(f"❌ 错误: 分组列 '{group_col}' 不存在于数据中！")
+        print(f"   可用的列: {full_df.columns}")
+        return
+    
+    # 检查数值列是否存在
+    missing_cols = [col for col in value_names if col not in full_df.columns]
+    if missing_cols:
+        print(f"❌ 错误: 以下数值列不存在于数据中: {missing_cols}")
+        print(f"   可用的列: {full_df.columns}")
+        return
     
     chrom_dict = load_chromosome_coordinate(args.chrom_dict_path)
+    total_window = chrom_dict.get(chrom_id, 0)
     
-    # 计算总窗口数
-    total_windows = 0
-    for chrom in range(1, args.total_chrom_count + 1):
-        if chrom in chrom_dict:
-            total_windows += chrom_dict[chrom]
+    if total_window == 0:
+        print(f"染色体 {chrom_id} 未找到或窗口数为0")
+        return
     
-    print(f"总窗口数: {total_windows}")
-    print(f"每窗口处理 {len(args.value_names)} 个字段")
-    print(f"总任务数: {total_windows * len(args.value_names)}\n")
+    print(f"染色体 {chrom_id} 共 {total_window} 个窗口")
+    print(f"分组列: {group_col}")
+    print(f"数值列: {value_names}")
+    print(f"MCMC配置: 固定 chains=4, warmup=2000, samples=2000, target_accept_prob=0.99")
+    print(f"🚨 严格过滤: R_hat > 1.01 的结果将被丢弃")
+    print(f"输出文件格式: hyper_chr{chrom_id}_win{{window}}_trait{trait_id}.parquet")
+    print(f"{'='*60}\n")
     
-    # 进度跟踪
-    progress = SimpleProgress(window_dir, args.srr_id)
+    processed_count = 0
+    success_count = 0
+    discarded_count = 0
+    skipped_count = 0
+    total_tasks = total_window * len(value_names)
     
-    start_time = time.time()
-    processed_windows = 0
-    completed_windows = 0
-    
-    for chrom in range(1, args.total_chrom_count + 1):
-        if chrom not in chrom_dict:
+    for window_id in range(total_window):
+        start_time = time.time()
+        print(f"[窗口 {window_id+1}/{total_window}] 处理: chr{chrom_id}_win{window_id}_trait{trait_id}")
+        
+        # ====== 加载数据（不再按 origin 过滤） ======
+        data = load_window_subset(full_df, chrom_id, window_id)
+        
+        if data.is_empty():
+            print(f"  窗口 {window_id} 无数据，跳过")
+            skipped_count += 1
             continue
         
-        total_window = chrom_dict[chrom]
+        # ====== 批量处理该窗口的所有数值列 ======
+        window_results = []
         
-        for window in range(total_window):
-            processed_windows += 1
-            window_file = window_dir / f"window_{chrom}_{window}_{args.srr_id}.parquet"
+        for value_col in value_names:
+            print(f"    计算: {value_col}")
             
-            # 断点续传
-            if args.resume and (window_file.exists() or progress.is_completed(chrom, window)):
-                completed_windows += 1
-                if processed_windows % 100 == 0:
-                    print(f"[{processed_windows}/{total_windows}] 跳过: chr{chrom} win{window}")
-                continue
+            result_df = run_bayesian_variance_jax(
+                data, 
+                trait_id, 
+                window_id, 
+                chrom_id,
+                group_col=group_col,
+                value_col=value_col
+            )
             
-            print(f"\n[{processed_windows}/{total_windows}] 处理: chr{chrom} win{window}")
-            window_start = time.time()
+            if result_df is not None:
+                window_results.append(result_df)
+                success_count += 1
+                
+                # 显示收敛状态
+                r_hat = result_df["r_hat_mean"].iloc[0]
+                ess = result_df["ess_mean"].iloc[0]
+                n_samples = result_df["n_samples"].iloc[0]
+                n_groups = result_df["n_groups"].iloc[0]
+                print(f"      ✅ R_hat={r_hat:.4f}, ESS={ess:.1f}, n_samples={n_samples}, n_groups={n_groups}")
+            else:
+                discarded_count += 1
+        
+        processed_count += 1
+        
+        # ====== 保存该窗口所有字段的结果 ======
+        if window_results:
+            # 合并同一窗口的多个字段
+            combined_df = pd.concat(window_results, ignore_index=True)
             
-            try:
-                data = load_boxcox_data(args.input_file_path, chrom, window)
-                if data.height == 0:
-                    print(f"  无数据，创建空结果")
-                    empty_results = []
-                    for trait_name in args.value_names:
-                        empty_results.append({
-                            'chra': chrom,
-                            'windowa': window,
-                            'trait_id': trait_name,
-                            'anova_sigma_alpha_sq': np.nan,
-                            'anova_sigma_epsilon_sq': np.nan,
-                            'anova_repeatability': np.nan,
-                            'anova_f_value': np.nan,
-                            'bayes_sigma_alpha_sq': np.nan,
-                            'bayes_sigma_epsilon_sq': np.nan,
-                            'bayes_repeatability': np.nan,
-                            'r_hat_sd_alpha': np.nan,
-                            'r_hat_sd_error': np.nan,
-                            'r_hat_mu': np.nan,
-                            'r_hat_mean': np.nan,
-                            'ess_sd_alpha': np.nan,
-                            'ess_sd_error': np.nan,
-                            'ess_mu': np.nan,
-                            'ess_mean': np.nan,
-                            'mean_accept_prob': np.nan,
-                        })
-                    result_df = pl.DataFrame(empty_results)
-                    # 重新排列列顺序：chra, windowa, trait_id 在前三列
-                    cols = ['chra', 'windowa', 'trait_id'] + [c for c in result_df.columns if c not in ['chra', 'windowa', 'trait_id']]
-                    result_df = result_df.select(cols)
-                    result_df.write_parquet(window_file)
-                    progress.mark_completed(chrom, window)
-                    completed_windows += 1
-                    continue
-                
-                # 计算该窗口所有字段
-                window_results = []
-                for trait_name in args.value_names:
-                    if trait_name not in data.columns:
-                        print(f"  跳过: {trait_name} (列不存在)")
-                        continue
-                    
-                    print(f"  计算: {trait_name}")
-                    calc_start = time.time()
-                    
-                    result_dict = bayesian_mixed_model_jax(
-                        data, args.group_variant, trait_name, trait_name
-                    )
-                    result_dict['chra'] = chrom
-                    result_dict['windowa'] = window
-                    window_results.append(result_dict)
-                    
-                    calc_time = time.time() - calc_start
-                    print(f"    耗时: {calc_time:.2f}s (warmup=400,samples=400,chains=4,parallel)")
-                    print(f"    接受概率: {result_dict.get('mean_accept_prob', 'N/A')}")
-                
-                # 保存该窗口所有字段，并调整列顺序
-                if window_results:
-                    result_df = pl.DataFrame(window_results)
-                    # 重新排列列顺序：chra, windowa, trait_id 在前三列
-                    cols = ['chra', 'windowa', 'trait_id'] + [c for c in result_df.columns if c not in ['chra', 'windowa', 'trait_id']]
-                    result_df = result_df.select(cols)
-                    result_df.write_parquet(window_file)
-                    progress.mark_completed(chrom, window)
-                    completed_windows += 1
-                    
-                    window_time = time.time() - window_start
-                    print(f"  ✓ 窗口完成: {window_file.name}")
-                    print(f"    窗口耗时: {window_time:.2f}s ({len(window_results)}个字段)")
-                else:
-                    print(f"  ✗ 无有效结果")
-                
-                # 进度预估
-                if completed_windows > 0:
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / completed_windows
-                    remaining = (total_windows - completed_windows) * avg_time
-                    print(f"  进度: {completed_windows}/{total_windows} ({completed_windows/total_windows*100:.1f}%)")
-                    print(f"  预计剩余: {remaining/3600:.2f}小时")
-                
-            except Exception as e:
-                print(f"  错误: {e}")
-                import traceback
-                traceback.print_exc()
-                error_file = window_dir / f"ERROR_{chrom}_{window}_{args.srr_id}.txt"
-                with open(error_file, 'w') as f:
-                    f.write(f"Error at {datetime.now()}\n{str(e)}\n\n{traceback.format_exc()}")
-                continue
+            # 新命名格式: hyper_chr{chrom}_win{window}_trait{trait}.parquet
+            file_name = f"hyper_chr{chrom_id}_win{window_id}_trait{trait_id}.parquet"
+            hyper_file = os.path.join(output_path, file_name)
+            combined_df.to_parquet(hyper_file, index=False)
+            
+            print(f"  ✅ 保存窗口结果: {file_name} ({len(window_results)} 个字段)")
+        else:
+            print(f"  ⚠️ 窗口 {window_id} 无有效结果")
+        
+        elapsed = time.time() - start_time
+        print(f"  窗口用时: {elapsed:.1f}s\n")
     
-    # 完成
-    print(f"\n{'='*60}")
-    print(f"完成！")
-    print(f"  处理窗口: {processed_windows}")
-    print(f"  完成计算: {completed_windows}")
-    print(f"  总耗时: {(time.time() - start_time)/3600:.2f}小时")
-    print(f"  结果保存在: {window_dir}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+    print(f"🎉 处理完成！")
+    print(f"  总窗口: {total_window}")
+    print(f"  总任务: {total_tasks} ({total_window} 窗口 × {len(value_names)} 字段)")
+    print(f"  处理窗口: {processed_count}")
+    print(f"  成功保存: {success_count}")
+    print(f"  丢弃任务: {discarded_count} (R_hat > 1.01)")
+    print(f"  跳过窗口: {skipped_count} (无数据)")
+    print(f"  输出目录: {output_path}")
+    print(f"{'='*60}")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
