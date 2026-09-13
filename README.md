@@ -43,13 +43,10 @@ conda activate statstools
 python -m pip install --upgrade pip
 python -m pip install -e .
 ```
-* 还得安装辅助 `Python` 模块
-```
-pip install connectorx
-pip install polars
-pip install jax
-pip install numpyro
-```
+项目依赖由 `pyproject.toml` 统一管理。执行 `python -m pip install -e .` 时会自动安装全部运行依赖。
+
+
+
 查看说明书：
 `statstools -h`
 
