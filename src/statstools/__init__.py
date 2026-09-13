@@ -102,7 +102,7 @@ class STATStools:
     def get_tool_descriptions(self):
         descriptions={}
         for tool_name, script_path in sorted(self.tools.items()):
-            descriptions = "暂无声明"
+            description = "暂无声明"
 
             try:
                 source = Path(script_path).read_text(encoding="utf-8-sig")
