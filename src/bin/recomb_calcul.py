@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+根据窗口组合计数计算重组率。
 # @FileName      : recomb_calcul
 # @Time          : 2025-11-16 10:48:48
 # @Author        : minghaocao

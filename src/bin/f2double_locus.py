@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+为每个 F2 个体构建跨染色体的焦点窗口与背景窗口组合。
 f2double_locus.py - F2双位点结构展开
 
 输入:  f2window.parquet

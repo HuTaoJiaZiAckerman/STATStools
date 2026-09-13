@@ -4,32 +4,42 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "statstools"
-version = "0.1.0"
+version = "0.2.0"
 description = "统一计算工具"
 authors = [
     {name = "caomh", email = "minghaocao@yeah.net"}
 ]
 license = {text = "MIT"}
 keywords = ["statistics", "tools", "calculation"]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-]
-dependencies = [
-    "polars>=0.19.3",
-    "pandas>=1.5.0",
-    "numpy>=1.21.0",
 ]
 
-requires-python = ">=3.8"
+# 需要安装的依赖
+dependencies = [
+    "polars>=1.35,<2",
+    "pandas>=2.2,<4",
+    "numpy>=1.26,<3",
+    "pyarrow>=14",
+    "scipy>=1.11,<2",
+    "matplotlib>=3.8,<4",
+    "seaborn>=0.13,<1",
+    "statannotations>=0.7,<1",
+    "scikit-learn>=1.3,<2",
+    "connectorx>=0.4,<1",
+    "jax>=0.4,<1",
+    "numpyro>=0.13,<1",
+    "openpyxl>=3.1,<4",
+    "xlrd>=2.0,<3",
+]
+# 限定python版本
+requires-python = ">=3.10"
 
 [project.optional-dependencies]
 dev = [

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+按指定字段分组计算数值列的描述性统计量。
 # @FileName      : description_statistic
 # @Time          : 2025-11-06 20:01:37
 # @Author        : minghaocao

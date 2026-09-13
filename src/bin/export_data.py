@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+使用 ConnectorX 从 MySQL 导出数据为 Parquet 文件。
 # @FileName      : export_data
 # @Time          : 2025-11-07 20:03:52
 # @Author        : minghaocao

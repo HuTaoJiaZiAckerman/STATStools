@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+统计输入字符串包含的字符数量。
 # @FileName      : string_count
 # @Time          : 2025-11-24 09:38:36
 # @Author        : minghaocao

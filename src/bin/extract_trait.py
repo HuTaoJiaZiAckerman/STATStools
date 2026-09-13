@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+按性状编号从总表提取一个性状的数据。
 # @FileName      : extract_trait
 # @Time          : 2025-11-04 17:08:18
 # @Author        : minghaocao

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Aggregate one phenotype for each two-window ancestry combination.
+"""按双窗口祖源组合聚合单个性状的均值、标准差和样本数量。
 
 The phenotype input is filtered to one trait before it is joined to the
 genotype data. Counts therefore refer only to individuals with a valid

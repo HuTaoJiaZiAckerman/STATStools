@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+查看 Parquet 文件内容和行数并支持排序。
 # @FileName      : show_parquet
 # @Time          : 2025-11-04 10:26:35
 # @Author        : minghaocao

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+为指定数值列绘制分布图、QQ 图和箱线图。
 # @FileName      : plot_normal
 # @Time          : 2025-11-04 14:31:25
 # @Author        : minghaocao

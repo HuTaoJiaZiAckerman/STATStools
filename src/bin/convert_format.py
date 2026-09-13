@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+在宽格式与长格式之间转换 Parquet 数据。
 # @FileName      : convert_format
 # @Time          : 2025-11-07 13:10:25
 # @Author        : minghaocao

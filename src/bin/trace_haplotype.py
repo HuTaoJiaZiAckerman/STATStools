@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+使用旧版家系追溯逻辑推断 F2 祖先单倍型来源。
 trace_haplotype_v2.py - 基于家系信息的F2祖先单倍型完整追溯模块
 v2: 与R脚本 F2.recoded.using.F1.or.F0.new.R 严格对齐
     主要修正：

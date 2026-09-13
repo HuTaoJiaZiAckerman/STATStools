@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+计算指定数值列的分位区间并添加标签。
 # @FileName      : quantile
 # @Time          : 2025-11-18 12:35:48
 # @Author        : minghaocao

@@ -1,3 +1,5 @@
+"""查看或按照映射文件重命名 Parquet 列。"""
+
 import argparse
 import os
 import polars as pl

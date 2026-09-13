@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+对指定数值列进行 Box-Cox 变换。
 # @FileName      : boxcox_convert
 # @Time          : 2025-11-06 15:09:35
 # @Author        : minghaocao

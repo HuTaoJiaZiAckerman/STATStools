@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+根据分布和方差条件比较两组数据的差异。
 # @FileName      : diff_test
 # @Time          : 2025-11-04 20:27:30
 # @Author        : minghaocao

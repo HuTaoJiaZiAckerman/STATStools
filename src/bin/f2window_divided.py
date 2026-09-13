@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+将 F2 逐 SNP 祖源追溯结果汇总为连续窗口的祖先单倍型状态。
 f2window_divided.py - 将SNP级祖先单倍型追溯结果按窗口聚合为单倍型块
 
 输入:  f2inheritance.parquet

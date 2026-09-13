@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+按照翻转方向筛选父本和母本效应记录。
 # @FileName      : filter_data
 # @Time          : 2025-11-06 10:49:05
 # @Author        : minghaocao

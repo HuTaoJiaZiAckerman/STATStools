@@ -8,6 +8,7 @@
 """
 import os
 import sys
+import ast # 自动读取src/bin下的脚本；
 import argparse
 import importlib.util
 from pathlib import Path
@@ -97,7 +98,34 @@ class STATStools:
         except Exception as e:
             print(f'检查工具：{script_path}时报错：{e}')
             return False
-        
+
+    def get_tool_descriptions(self):
+        descriptions={}
+        for tool_name, script_path in sorted(self.tools.items()):
+            descriptions = "暂无声明"
+
+            try:
+                source = Path(script_path).read_text(encoding="utf-8-sig")
+                module = ast.parse(source)
+                docstring = ast.get_docstring(module)
+
+                if docstring:
+                    description = next(
+                        (
+                            line.strip()
+                            for line in docstring.splitlines()
+                            if line.strip()
+                        ),
+                        "暂无说明",
+                    )
+
+            except (OSError, UnicodeError, SyntaxError):
+                pass
+
+            descriptions[tool_name] = description
+
+        return descriptions
+
     def load_module(self,script_path):
         try:
             spec = importlib.util.spec_from_file_location("tool_modeul",script_path)
@@ -133,36 +161,51 @@ class STATStools:
             print(f"错误，工具'{tool_name}'没有有效的main函数。")
 
 def main():
-    parser = argparse.ArgumentParser(description='STATStools - 统一工具集',formatter_class=argparse.RawDescriptionHelpFormatter,epilog=f"""
-示例用法：
+    stats_tools = STATStools()
+    tool_descriptions = stats_tools.get_tool_descriptions()
+
+    if tool_descriptions:
+        name_width = max(len(name) for name in tool_descriptions)
+
+        tool_lines = [
+            f"    {name:<{name_width}}  {description}"
+            for name, description in tool_descriptions.items()
+        ]
+
+        tools_help = "可用工具\n" + "\n".join(tool_lines)
+    else:
+        tools_help = "可用工具\n    暂无可用工具"
+
+    parser = argparse.ArgumentParser(
+        description="STATStools 统一工具集",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+示例用法
     statstools show_parquet -i input_file.parquet -n 10
-    statstools description_statistic -i input_file.parquet -g windowa,origin -v effect_value -o ./output_file.parquet
-可用工具：
-    • bayes_variance            - 计算方差（Bayes和ANOVA两种方法）
-    • boxcox_convert            - 数据的BoxCox 转换（正态性转换）
-    • concat_parquet            - 合并parquet格式文件（多个文件纵向合并，需要保证列数一致）
-    • convert_format            - 长数据格式转短数据格式
-    • description_statistic     - 对数据进行描述性统计分析
-    • diff_test                 - 两组差异性检验
-    • export_data               - 导出数据（MySQL导出到本地，并以parquet格式存储）
-    • extract_trait             - 提取性状（从某一列分别提取唯一值所在的行，并生成新的子集文件）
-    • filter_data               - 过滤数据（按照特定条件过滤数据）
-    • plot_normal               - 正态分布绘图
-    • saved_trait               - 保存性状数据
-    • show_parquet              - 展示parquet格式文件
-    • string_count              - 字符串计数
-""")
-    # 将tool改为可选参数
-    parser.add_argument('tool', nargs='?', help='要使用的工具名')
-    parser.add_argument('args', nargs=argparse.REMAINDER, help='工具参数')
+    statstools f2trace_haplotype -h
+
+{tools_help}
+""",
+    )
+
+    parser.add_argument(
+        "tool",
+        nargs="?",
+        help="要使用的工具名",
+    )
+    parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="工具参数",
+    )
+
     args = parser.parse_args()
-    # 如果没有提供工具名，显示帮助
+
     if args.tool is None:
         parser.print_help()
         return 0
 
-    stats_tools = STATStools()
-    return stats_tools.run_tool(args.tool,args.args)
+    return stats_tools.run_tool(args.tool, args.args)
     
 if __name__ == '__main__':
     sys.exit(main())

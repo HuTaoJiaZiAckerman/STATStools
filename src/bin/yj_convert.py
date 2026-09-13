@@ -1,6 +1,7 @@
 #! /public/home/xiehaibing7/.conda/envs/ipython/bin/python3.13
 # -*- coding:utf-8 -*- 
 """
+对指定 Parquet 数值列执行 Yeo-Johnson 变换。
 # File Name: yj_trans.py
 # Author: caomh
 # Created Time: 10:36  2026-05-23

@@ -1,6 +1,7 @@
 #!/home/minghaocao/miniconda3/bin/python3
 # -*- coding:utf-8 -*- 
 """
+为 Parquet 数据新增一个具有固定值的字段。
 # File Name: add_constent_field.py
 # Author: caomh
 # Created Time: 22:17  2025-12-04

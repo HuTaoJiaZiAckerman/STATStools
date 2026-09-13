@@ -1,6 +1,7 @@
 #! /public/home/xiehaibing7/.conda/envs/ipython/bin/python3.13
 # -*- coding: utf-8 -*-
 """
+使用 ANOVA 和贝叶斯模型估计分组方差与重复力。
 # File Name: bayes_variance_vend.py
 # Author: minghaocao 
 # Created Time: 2026-6-28

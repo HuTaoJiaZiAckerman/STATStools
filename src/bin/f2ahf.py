@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Calculate paternal and maternal ancestral haplotype flip results.
+"""计算父本和母本相位的祖先单倍型翻转效应。
 
 For both routes the difference direction is state 0 minus state 1. Counts are
 retained when either state is absent. Phenotypic differences are reported only

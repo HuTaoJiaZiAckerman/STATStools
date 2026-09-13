@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+计算分组统计并绘制带显著性检验的箱线图。
 # @FileName      : plot_boxplot
 # @Time          : 2025-12-01 10:57:14
 # @Author        : minghaocao

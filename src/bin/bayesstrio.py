@@ -1,6 +1,7 @@
 #! /public/home/xiehaibing7/.conda/envs/ipython/bin/python3.13
 # -*- coding:utf-8 -*-
 """
+使用贝叶斯异方差模型分析父本或母本来源效应。
 # File Name: bayesstrio_jax_vend_v2.py （测试版本命名，已经可用于实践）
 # Author: caomh
 # Created Time: 2026-6-30

@@ -37,10 +37,11 @@
 * 然后进入文件夹安装软件。
 ```shell
 git clone git@github.com:HuTaoJiaZiAckerman/STATStools.git
-conda create -n statstools
-conda activate statstools
 cd STATStools
-pip install -e .
+conda create -n statstools python=3.10 -y
+conda activate statstools
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 * 还得安装辅助 `Python` 模块
 ```

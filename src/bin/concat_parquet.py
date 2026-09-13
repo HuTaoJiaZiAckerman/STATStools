@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+纵向合并多个 Parquet 文件。
 # @FileName      : concat_parquet
 # @Time          : 2025-11-08 10:19:27
 # @Author        : minghaocao

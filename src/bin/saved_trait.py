@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+根据样本量和取值离散程度筛选可用性状。
 # @FileName      : saved_trait
 # @Time          : 2025-11-03 17:27:23
 # @Author        : minghaocao

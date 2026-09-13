@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """
+根据共同坐标列将查询字段合并到目标 Parquet 表。
 # @FileName      : vlookup
 # @Time          : 2025-11-17 12:54:17
 # @Author        : minghaocao
