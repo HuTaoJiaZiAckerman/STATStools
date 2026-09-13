@@ -54,7 +54,8 @@ pip install numpyro
 `statstools -h`
 
 ## 3. 帮助页面
-请查看[wiki](https://github.com/HuTaoJiaZiAckerman/STATStools/wiki)页面，已获得更多使用说明。
+
+请查看[本地工具文档](docs/README.md)。GitHub Wiki 只保留文档导航。
 
 ## 4. 联系我
 `xueshengcaominghao@163.com` 或者 `caominghao@kiz.mail.ac.cn` 。
