@@ -11,6 +11,7 @@ import sys
 import ast # 自动读取src/bin下的脚本；
 import argparse
 import importlib.util
+import stat
 from pathlib import Path
 
 class STATStools:
@@ -83,9 +84,14 @@ class STATStools:
             #检查文件是否存在，且是python格式
             if not os.path.exists(script_path) or not script_path.endswith('.py'):
                 return False
-            #检查文件是否可执行
-            if not os.access(script_path,os.X_OK):
-                print(f'警告：{script_path}不可执行！')
+            # Linux 和 macOS 首次扫描时自动添加执行权限
+            if os.name != "nt" and not os.access(script_path, os.X_OK):
+                try:
+                    current_mode = os.stat(script_path).st_mode
+                    execute_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                    os.chmod(script_path, current_mode | execute_bits)
+                except OSError as e:
+                    print(f"警告：无法为 {script_path} 添加执行权限：{e}")
             #检查文件是不是main函数
             with open(script_path, 'r',encoding='utf-8') as f:
                 content = f.read()
