@@ -29,10 +29,8 @@ from pathlib import Path
 
 import polars as pl
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from statstools.logging_utils import configure_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +71,8 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output)
     window_size = args.size
+
+    configure_logging(output_path.parent, "f2window_divided")
 
     # ─── 参数校验 ────────────────────────────────────────────────
     if window_size <= 0:

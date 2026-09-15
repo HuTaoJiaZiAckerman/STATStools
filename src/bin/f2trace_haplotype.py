@@ -18,7 +18,8 @@ import argparse
 import sys
 from collections import Counter
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from statstools.logging_utils import configure_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -1097,6 +1098,12 @@ def main():
                         help='低信息片段的质量控制报告阈值（默认: 10）')
 
     args = parser.parse_args()
+
+    configure_logging(
+        Path(args.output),
+        "f2trace_haplotype",
+        f"chr{args.chrom}",
+    )
 
     tracer = HaplotypeTracer(
         args.haps,

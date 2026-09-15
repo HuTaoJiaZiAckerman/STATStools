@@ -17,11 +17,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from statstools.logging_utils import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 GROUP_KEYS = [
@@ -184,11 +181,12 @@ def main() -> None:
     input_path = Path(args.input)
     pheno_path = Path(args.pheno)
     output_dir = Path(args.output)
+    configure_logging(output_dir, "f2aggregation", f"trait{args.trait_id}")
+
     for path in [input_path, pheno_path]:
         if not path.exists():
             logger.error("输入文件不存在 %s", path)
             sys.exit(1)
-    output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"trait_{args.trait_id}_aggregation.parquet"
 
     try:

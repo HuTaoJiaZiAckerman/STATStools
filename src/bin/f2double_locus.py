@@ -37,10 +37,8 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from statstools.logging_utils import configure_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +54,8 @@ def main():
 
     input_path = Path(args.input)
     output_path = Path(args.output)
+
+    configure_logging(output_path.parent, "f2double_locus")
 
     if not input_path.exists():
         logger.error(f"输入文件不存在: {input_path}")

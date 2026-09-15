@@ -15,11 +15,8 @@ from pathlib import Path
 
 import polars as pl
 
+from statstools.logging_utils import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 WINDOW_KEYS = ["chra", "windowa", "chrb", "windowb"]
@@ -161,11 +158,11 @@ def main() -> None:
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
+    configure_logging(output_dir, "f2ahf", f"trait{args.trait_id}")
+
     if not input_path.exists():
         logger.error("输入文件不存在 %s", input_path)
         sys.exit(1)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     try:
         data = pl.scan_parquet(input_path)
         validate_input(data.collect_schema())
