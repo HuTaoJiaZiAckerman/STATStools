@@ -4,6 +4,7 @@
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -12,7 +13,9 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from numba import get_num_threads, njit, prange, set_num_threads
 
 from statstools.logging_utils import configure_logging
 
@@ -25,6 +28,7 @@ ROUTES = {
     "paternal": ("allelea", ("peerallelea", "alleleb", "peeralleleb")),
     "maternal": ("peerallelea", ("allelea", "alleleb", "peeralleleb")),
 }
+CHROMOSOME_SHIFT = 1 << 32
 
 
 def read_phenotype(path, trait_id):
@@ -95,57 +99,134 @@ def load_genotypes(path, phenotype):
     return windows, sexes, traits
 
 
-def membership(row, route, windows, sexes, effect):
-    a = windows.get((row["chra"], row["windowa"]))
-    b = windows.get((row["chrb"], row["windowb"]))
-    if a is None or b is None:
+def dense_genotypes(windows):
+    """Give the compiled kernel compact, sorted window indexes."""
+    ordered = sorted(windows)
+    keys = np.array([chrom * CHROMOSOME_SHIFT + window for chrom, window in ordered], dtype=np.int64)
+    matrix = np.ascontiguousarray(np.stack([windows[key] for key in ordered]), dtype=np.int8)
+    return keys, matrix
+
+
+def column_numpy(batch, name, dtype, allow_null=False):
+    column = batch.column(batch.schema.get_field_index(name))
+    if column.null_count and not allow_null:
+        raise ValueError(f"AHF 输入列 {name} 含有缺失值")
+    return np.ascontiguousarray(column.to_numpy(zero_copy_only=False), dtype=dtype)
+
+
+def lookup_windows(batch, keys, prefix):
+    packed = (
+        column_numpy(batch, f"chr{prefix}", np.int64) * CHROMOSOME_SHIFT
+        + column_numpy(batch, f"window{prefix}", np.int64)
+    )
+    indexes = np.searchsorted(keys, packed)
+    if np.any(indexes >= len(keys)) or np.any(keys[indexes] != packed):
         raise ValueError("AHF 结果中的窗口不在双窗口基因型数据中")
-    states = {
-        "allelea": a[0], "peerallelea": a[1],
-        "alleleb": b[0], "peeralleleb": b[1],
-    }
-    flipped, fixed = ROUTES[route]
-    mask = np.ones(len(sexes), dtype=bool)
-    for column in fixed:
-        mask &= states[column] == row[column]
-    if effect == "male_delta_m":
-        mask &= sexes == 1
-    elif effect == "female_delta_m":
-        mask &= sexes == 2
-    return mask & (states[flipped] == 0), mask & (states[flipped] == 1)
+    return np.ascontiguousarray(indexes, dtype=np.int32)
 
 
-def permutation_p_value(values, group_zero, group_one, sexes, observed, count, rng):
-    """Shuffle values within sex among the two fixed-genotype groups."""
-    selected = group_zero | group_one
-    values = values[selected]
-    labels = group_zero[selected]
-    sex = sexes[selected]
-    n0 = int(labels.sum())
-    n1 = len(labels) - n0
-    calculated = values[labels].mean() - values[~labels].mean()
-    if not np.isclose(calculated, observed, rtol=1e-5, atol=1e-5):
-        raise ValueError(f"AHF 与个体数据不一致，原效应 {observed}，重算 {calculated}")
-    strata = [(values[sex == code], labels[sex == code]) for code in (1, 2)]
-    if sum(len(group) for group, _ in strata) != len(values):
-        raise ValueError("个体性别必须编码为 1 或 2")
-    extreme = 0
-    completed = 0
-    batch_size = max(1, min(1024, 2_000_000 // max(len(values), 1)))
-    while completed < count:
-        size = min(batch_size, count - completed)
-        sum_zero = np.zeros(size, dtype=np.float64)
-        sum_one = np.zeros(size, dtype=np.float64)
-        for group, group_labels in strata:
-            if len(group) == 0:
+@njit(parallel=True, cache=True)
+def permutation_batch(genotypes, sexes, values, a_indexes, b_indexes,
+                      fixed_a, fixed_bp, fixed_bm, observed, expected_zero,
+                      expected_one, route_code, effect_code, permutations,
+                      seed, row_offset):
+    """Parallelize independent contrasts without sharing a random generator."""
+    p_values = np.full(len(observed), np.nan)
+    errors = np.zeros(len(observed), dtype=np.int8)
+    individuals = len(values)
+    for i in prange(len(observed)):
+        if not np.isfinite(observed[i]):
+            continue
+        male = np.empty(individuals, dtype=np.float64)
+        female = np.empty(individuals, dtype=np.float64)
+        male_labels = np.empty(individuals, dtype=np.uint8)
+        female_labels = np.empty(individuals, dtype=np.uint8)
+        male_zero = 0
+        male_one = 0
+        female_zero = 0
+        female_one = 0
+        male_total = 0.0
+        female_total = 0.0
+        original_zero = 0.0
+        a = a_indexes[i]
+        b = b_indexes[i]
+        for person in range(individuals):
+            if route_code == 0:
+                if genotypes[a, 1, person] != fixed_a[i]:
+                    continue
+                flipped = genotypes[a, 0, person]
+            else:
+                if genotypes[a, 0, person] != fixed_a[i]:
+                    continue
+                flipped = genotypes[a, 1, person]
+            if (genotypes[b, 0, person] != fixed_bp[i]
+                    or genotypes[b, 1, person] != fixed_bm[i]
+                    or (flipped != 0 and flipped != 1)):
                 continue
-            shuffled = rng.permuted(np.broadcast_to(group, (size, len(group))).copy(), axis=1)
-            sum_zero += shuffled[:, group_labels].sum(axis=1)
-            sum_one += shuffled[:, ~group_labels].sum(axis=1)
-        contrast = sum_zero / n0 - sum_one / n1
-        extreme += int(np.count_nonzero(np.abs(contrast) >= abs(observed) - 1e-10))
-        completed += size
-    return (extreme + 1) / (count + 1)
+            sex = sexes[person]
+            if effect_code != 0 and sex != effect_code:
+                continue
+            value = values[person]
+            if sex == 1:
+                position = male_zero + male_one
+                male[position] = value
+                male_labels[position] = flipped == 0
+                male_total += value
+                if flipped == 0:
+                    male_zero += 1
+                    original_zero += value
+                else:
+                    male_one += 1
+            elif sex == 2:
+                position = female_zero + female_one
+                female[position] = value
+                female_labels[position] = flipped == 0
+                female_total += value
+                if flipped == 0:
+                    female_zero += 1
+                    original_zero += value
+                else:
+                    female_one += 1
+            else:
+                errors[i] = 3
+        n_zero = male_zero + female_zero
+        n_one = male_one + female_one
+        if n_zero != expected_zero[i] or n_one != expected_one[i] or n_zero == 0 or n_one == 0:
+            errors[i] = 1
+            continue
+        total = male_total + female_total
+        calculated = original_zero / n_zero - (total - original_zero) / n_one
+        if abs(calculated - observed[i]) > 1e-5 + 1e-5 * abs(observed[i]):
+            errors[i] = 2
+            continue
+        if errors[i]:
+            continue
+
+        # Each row has its own seed, independent of thread scheduling.
+        row_seed = (seed ^ ((row_offset + i + 1) * 2654435761)) & 0xFFFFFFFF
+        np.random.seed(row_seed)
+        extreme = 0
+        n_male = male_zero + male_one
+        n_female = female_zero + female_one
+        for _ in range(permutations):
+            for k in range(n_male - 1, 0, -1):
+                other = np.random.randint(k + 1)
+                male[k], male[other] = male[other], male[k]
+            for k in range(n_female - 1, 0, -1):
+                other = np.random.randint(k + 1)
+                female[k], female[other] = female[other], female[k]
+            permuted_zero = 0.0
+            for k in range(n_male):
+                if male_labels[k]:
+                    permuted_zero += male[k]
+            for k in range(n_female):
+                if female_labels[k]:
+                    permuted_zero += female[k]
+            contrast = permuted_zero / n_zero - (total - permuted_zero) / n_one
+            if abs(contrast) >= abs(observed[i]) - 1e-10:
+                extreme += 1
+        p_values[i] = (extreme + 1) / (permutations + 1)
+    return p_values, errors
 
 
 def validate_ahf(file, route, trait_id, effect):
@@ -166,25 +247,45 @@ def validate_ahf(file, route, trait_id, effect):
     return source, counts[effect]
 
 
-def calculate_route(file, route, trait_id, effect, windows, sexes, values,
-                    permutations, rng, p_values, offset):
+def calculate_route(file, route, trait_id, effect, keys, genotypes, sexes, values,
+                    permutations, seed, p_values, offset):
     source, count_columns = validate_ahf(file, route, trait_id, effect)
     examined = 0
     started = time.monotonic()
     last_report = started
-    for batch in source.iter_batches(batch_size=128):
-        for row in batch.to_pylist():
-            if row["trait_id"] != trait_id or row["flip_type"] != route:
-                raise ValueError(f"{file} 的性状编号或传递路径与参数不一致")
-            observed = row[effect]
-            if observed is not None and np.isfinite(observed):
-                zero, one = membership(row, route, windows, sexes, effect)
-                if int(zero.sum()) != row[count_columns[0]] or int(one.sum()) != row[count_columns[1]]:
-                    raise ValueError("AHF 分组人数与个体数据不一致")
-                p_values[offset + examined] = permutation_p_value(
-                    values, zero, one, sexes, observed, permutations, rng
-                )
-            examined += 1
+    needed = WINDOWS + GENOTYPES + ["trait_id", "flip_type", effect] + list(count_columns)
+    for batch in source.iter_batches(batch_size=32768, columns=needed):
+        if np.any(column_numpy(batch, "trait_id", np.int64) != trait_id):
+            raise ValueError(f"{file} 的性状编号与参数不一致")
+        if pc.unique(batch.column(batch.schema.get_field_index("flip_type"))).to_pylist() != [route]:
+            raise ValueError(f"{file} 的传递路径与参数不一致")
+        a_indexes = lookup_windows(batch, keys, "a")
+        b_indexes = lookup_windows(batch, keys, "b")
+        fixed_a_name = "peerallelea" if route == "paternal" else "allelea"
+        fixed_a = column_numpy(batch, fixed_a_name, np.int8)
+        fixed_bp = column_numpy(batch, "alleleb", np.int8)
+        fixed_bm = column_numpy(batch, "peeralleleb", np.int8)
+        observed = column_numpy(batch, effect, np.float64, allow_null=True)
+        expected_zero = column_numpy(batch, count_columns[0], np.int64)
+        expected_one = column_numpy(batch, count_columns[1], np.int64)
+        route_code = 0 if route == "paternal" else 1
+        effect_code = {"delta_m": 0, "male_delta_m": 1, "female_delta_m": 2}[effect]
+        batch_p, errors = permutation_batch(
+            genotypes, sexes, values, a_indexes, b_indexes, fixed_a, fixed_bp,
+            fixed_bm, observed, expected_zero, expected_one, route_code,
+            effect_code, permutations, seed, offset + examined,
+        )
+        bad = np.flatnonzero(errors)
+        if len(bad):
+            index = int(bad[0])
+            meanings = {1: "分组人数", 2: "翻转效应", 3: "性别编码"}
+            raise ValueError(
+                f"{file} 第 {examined + index + 1} 行的{meanings[int(errors[index])]}"
+                "与个体数据不一致"
+            )
+        end = offset + examined + len(batch_p)
+        p_values[offset + examined:end] = batch_p
+        examined += len(batch_p)
         now = time.monotonic()
         if now - last_report >= 60:
             rate = examined / (now - started)
@@ -235,6 +336,8 @@ def run(args):
             raise ValueError(f"输入文件不存在 {path}")
     phenotype = read_phenotype(paths[1], args.trait_id)
     windows, sexes, values = load_genotypes(paths[0], phenotype)
+    keys, genotypes = dense_genotypes(windows)
+    del windows
     sources = [pq.ParquetFile(path) for path in paths[2:]]
     lengths = [source.metadata.num_rows for source in sources]
     total = sum(lengths)
@@ -249,13 +352,13 @@ def run(args):
     adjusted = np.memmap(scratch_q, dtype="float64", mode="w+", shape=(total,))
     p_values[:] = np.nan
     adjusted[:] = np.nan
-    rng = np.random.default_rng(args.seed)
     try:
         offset = 0
         for route, path, length in zip(ROUTES, paths[2:], lengths):
             examined = calculate_route(path, route, args.trait_id, args.effect_column,
-                                       windows, sexes, values, args.n_permutations,
-                                       rng, p_values, offset)
+                                       keys, genotypes, sexes, values,
+                                       args.n_permutations, args.seed, p_values,
+                                       offset)
             if examined != length:
                 raise ValueError("读取行数与 AHF 元数据不一致")
             offset += length
@@ -284,13 +387,22 @@ def main():
                         help="delta_m、male_delta_m 或 female_delta_m")
     parser.add_argument("--n_permutations", required=True, type=int, help="每行置换次数，必须大于零")
     parser.add_argument("--seed", required=True, type=int, help="随机种子")
+    parser.add_argument("--threads", type=int, default=None, help="Numba 计算线程数，默认使用分配到的 CPU 核数")
     args = parser.parse_args()
     if args.effect_column not in EFFECTS:
         parser.error("请在 delta_m、male_delta_m、female_delta_m 三个字段中任选一个")
     if args.n_permutations < 1:
         parser.error("--n_permutations 必须为正整数")
+    if not 0 <= args.seed <= 0xFFFFFFFF:
+        parser.error("--seed 必须为 0 到 4294967295 之间的整数")
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads 必须为正整数")
     configure_logging(args.output, "f2permutation_test", f"trait{args.trait_id}_{args.effect_column}")
     try:
+        if args.threads is not None:
+            set_num_threads(args.threads)
+        logger.info("Numba 计算线程数 %s，可用 CPU 核数 %s", get_num_threads(),
+                    len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())
         started = time.time()
         run(args)
         logger.info("完成，耗时 %.1f 秒", time.time() - started)
