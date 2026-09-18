@@ -26,7 +26,7 @@
 * [diff_test](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/diff_test.md)
 * [saved_trait](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/saved_trait.md)
 * [filter_data](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/filter_data.md)
-* [recomb_calcul](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/recomb_calcul.md)
+* [f2recombination_rate](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2recombination_rate.md)
 
 ## 绘图
 

@@ -35,7 +35,7 @@ statstools show_parquet -h
 * [diff_test](diff_test.md)  按性状比较两个来源组的表型差异，并根据分布与方差选择检验方法。
 * [saved_trait](saved_trait.md)  从 MySQL 读取表型数据，并按样本量和取值离散程度筛选性状。
 * [filter_data](filter_data.md)  从旧版父本和母本翻转结果中提取指定翻转方向且雄性表型效应为正的记录。
-* [recomb_calcul](recomb_calcul.md)  根据相邻记录中的父本和母本 F1 来源变化，按 1 Mb 窗口汇总重组计数和比例。
+* [f2recombination_rate](f2recombination_rate.md)  按可配置窗口统计 F2 父本和母本重组事件，并按指定群体人数计算重组率。
 
 ## 绘图
 
