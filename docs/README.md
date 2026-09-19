@@ -52,6 +52,7 @@ statstools show_parquet -h
 * [f2trace_haplotype](f2trace_haplotype.md)  利用 SHAPEIT2 定相结果和系谱追溯 F2 每条单倍型的亲本来源与祖源谱系。
 * [f2window_divided](f2window_divided.md)  将逐 SNP 的 F2 祖源追溯结果聚合为连续基因组窗口。
 * [f2double_locus](f2double_locus.md)  为每个 F2 个体生成焦点窗口 A 与局部背景窗口 B 的有序组合。
-* [f2aggregation](f2aggregation.md)  将双窗口基因型组合与一个性状的观测值连接，并计算总体、雄性和雌性的均值、标准差与样本量。
+* [f2aggregation](f2aggregation.md)  将双窗口基因型组合与一个性状的观测值连接，并聚合原始与标准化表型统计量。
+* [f2hybrid_effect](f2hybrid_effect.md)  在固定背景窗口 B 的祖源状态后，计算焦点窗口 A 的纯合减杂合表型效应。
 * [f2ahf](f2ahf.md)  在匹配的局部遗传背景中分别计算父本和母本祖先单倍型的表型翻转效应与丰度翻转效应。
 * [trace_haplotype](trace_haplotype.md)  旧版 F2 单倍型来源追溯工具。

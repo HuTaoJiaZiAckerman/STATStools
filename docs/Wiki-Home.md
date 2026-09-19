@@ -44,5 +44,6 @@
 * [f2window_divided](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2window_divided.md)
 * [f2double_locus](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2double_locus.md)
 * [f2aggregation](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2aggregation.md)
+* [f2hybrid_effect](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2hybrid_effect.md)
 * [f2ahf](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/f2ahf.md)
 * [trace_haplotype](https://github.com/HuTaoJiaZiAckerman/STATStools/blob/main/docs/trace_haplotype.md)

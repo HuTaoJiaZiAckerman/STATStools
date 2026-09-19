@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按双窗口祖源组合聚合单个性状的均值、标准差和样本数量。
+"""按双窗口祖源组合聚合单个性状的原始及标准化表型统计量。
 
 The phenotype input is filtered to one trait before it is joined to the
 genotype data. Counts therefore refer only to individuals with a valid
@@ -107,6 +107,36 @@ def validate_genotype_schema(schema: pl.Schema) -> None:
         raise ValueError(f"双窗口输入缺少必要列 {sorted(missing)}")
 
 
+def standardize_phenotype(
+    phenotype: pd.DataFrame,
+    sex_by_id: dict[int, int],
+) -> pd.DataFrame:
+    """Create all, male, and female z scores from unique matched F2 records."""
+    phenotype = phenotype.copy()
+    phenotype["sex"] = phenotype["f2"].map(sex_by_id)
+    if phenotype["sex"].isna().any():
+        missing = phenotype.loc[phenotype["sex"].isna(), "f2"].head(5).tolist()
+        raise ValueError(f"匹配个体缺少性别信息。个体示例 {missing}")
+
+    phenotype["z_value"] = np.nan
+    phenotype["sex_z_value"] = np.nan
+    populations = [
+        ("总体", pd.Series(True, index=phenotype.index), "z_value"),
+        ("雄性", phenotype["sex"] == 1, "sex_z_value"),
+        ("雌性", phenotype["sex"] == 2, "sex_z_value"),
+    ]
+    for label, mask, output_column in populations:
+        values = phenotype.loc[mask, "trait_value"]
+        mean = float(values.mean()) if len(values) else float("nan")
+        sd = float(values.std(ddof=1)) if len(values) >= 2 else float("nan")
+        logger.info("  %s标准化样本数 %s，均值 %s，样本标准差 %s", label, len(values), mean, sd)
+        if not np.isfinite(sd) or sd == 0:
+            logger.warning("  %s表型无法进行 z-score 标准化，对应标准化结果记为缺失", label)
+            continue
+        phenotype.loc[mask, output_column] = (values - mean) / sd
+    return phenotype
+
+
 def aggregate_trait(
     input_path: Path,
     phenotype: pd.DataFrame,
@@ -118,13 +148,32 @@ def aggregate_trait(
     validate_genotype_schema(genotype_scan.collect_schema())
 
     phenotype_ids = phenotype["f2"].astype("int64").tolist()
-    genotype_ids = set(
+    individual_sex = (
         genotype_scan
-        .select(pl.col("f2").unique())
+        .select(["f2", "sex"])
+        .unique()
+        .group_by("f2")
+        .agg([
+            pl.col("sex").n_unique().alias("sex_count"),
+            pl.col("sex").first().alias("sex"),
+        ])
         .collect(engine="streaming")
-        .get_column("f2")
-        .to_list()
     )
+    conflicts = individual_sex.filter(pl.col("sex_count") != 1)
+    if conflicts.height:
+        examples = conflicts.get_column("f2").head(5).to_list()
+        raise ValueError(f"同一个体存在多个性别编码。个体示例 {examples}")
+    invalid_sex = individual_sex.filter(
+        pl.col("sex").is_null() | ~pl.col("sex").is_in([1, 2])
+    )
+    if invalid_sex.height:
+        examples = invalid_sex.select(["f2", "sex"]).head(5).rows()
+        raise ValueError(f"性别编码必须为 1 或 2。异常示例 {examples}")
+    sex_by_id = dict(zip(
+        individual_sex.get_column("f2").to_list(),
+        individual_sex.get_column("sex").to_list(),
+    ))
+    genotype_ids = set(sex_by_id)
     matched_ids = set(phenotype_ids) & genotype_ids
     unmatched_ids = set(phenotype_ids) - genotype_ids
 
@@ -135,7 +184,10 @@ def aggregate_trait(
         raise ValueError("指定性状没有任何个体能够匹配双窗口基因型数据")
 
     phenotype = phenotype.loc[phenotype["f2"].isin(matched_ids)].copy()
-    phenotype_lazy = pl.from_pandas(phenotype[["f2", "trait_value"]]).lazy()
+    phenotype = standardize_phenotype(phenotype, sex_by_id)
+    phenotype_lazy = pl.from_pandas(
+        phenotype[["f2", "trait_value", "z_value", "sex_z_value"]]
+    ).lazy()
     matched_id_list = sorted(matched_ids)
 
     pipeline = (
@@ -147,18 +199,26 @@ def aggregate_trait(
             pl.col("trait_value").mean().alias("mean"),
             pl.col("trait_value").std(ddof=1).alias("sd"),
             pl.len().alias("count"),
+            pl.col("z_value").mean().alias("z_mean"),
+            pl.col("z_value").std(ddof=1).alias("z_sd"),
             pl.col("trait_value").filter(pl.col("sex") == 1).mean().alias("male_mean"),
             pl.col("trait_value").filter(pl.col("sex") == 1).std(ddof=1).alias("male_sd"),
             pl.col("trait_value").filter(pl.col("sex") == 1).len().alias("male_count"),
+            pl.col("sex_z_value").filter(pl.col("sex") == 1).mean().alias("male_z_mean"),
+            pl.col("sex_z_value").filter(pl.col("sex") == 1).std(ddof=1).alias("male_z_sd"),
             pl.col("trait_value").filter(pl.col("sex") == 2).mean().alias("female_mean"),
             pl.col("trait_value").filter(pl.col("sex") == 2).std(ddof=1).alias("female_sd"),
             pl.col("trait_value").filter(pl.col("sex") == 2).len().alias("female_count"),
+            pl.col("sex_z_value").filter(pl.col("sex") == 2).mean().alias("female_z_mean"),
+            pl.col("sex_z_value").filter(pl.col("sex") == 2).std(ddof=1).alias("female_z_sd"),
         ])
         .with_columns(pl.lit(trait_id, dtype=pl.Int64).alias("trait_id"))
         .select(GROUP_KEYS + [
             "trait_id", "mean", "sd", "count",
             "male_mean", "male_sd", "male_count",
             "female_mean", "female_sd", "female_count",
+            "z_mean", "z_sd", "male_z_mean", "male_z_sd",
+            "female_z_mean", "female_z_sd",
         ])
         .sort(GROUP_KEYS)
     )
