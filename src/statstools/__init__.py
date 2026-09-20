@@ -14,6 +14,54 @@ import importlib.util
 import stat
 from pathlib import Path
 
+
+def _visible_cpu_count():
+    """Return the CPUs available to the current process."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
+def _thread_argument(args):
+    """Read -t or --threads without importing the selected tool."""
+    requested = None
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value in {"-t", "--threads"}:
+            if index + 1 >= len(args):
+                raise ValueError(f"{value} 后必须提供线程数")
+            raw = args[index + 1]
+            index += 2
+        elif value.startswith("--threads="):
+            raw = value.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        try:
+            requested = int(raw)
+        except ValueError as exc:
+            raise ValueError("线程数必须为正整数") from exc
+        if requested < 1:
+            raise ValueError("线程数必须为正整数")
+    return requested
+
+
+def _configure_polars_threads(args):
+    """Configure Polars before a tool module imports it."""
+    visible = _visible_cpu_count()
+    requested = _thread_argument(args)
+    actual = min(requested if requested is not None else visible, visible)
+    os.environ["POLARS_MAX_THREADS"] = str(actual)
+    os.environ["STATSTOOLS_REQUESTED_THREADS"] = str(
+        requested if requested is not None else visible
+    )
+    os.environ["STATSTOOLS_VISIBLE_THREADS"] = str(visible)
+    return requested, visible, actual
+
+
 class STATStools:
     _tools_loaded = False
     _tools = {}
@@ -148,6 +196,12 @@ class STATStools:
             print(f"可用工具：{', ' .join(self.tools.keys())}")
             return 1
         script_path = self.tools[tool_name]
+        if tool_name == "f2hybrid_effect":
+            try:
+                _configure_polars_threads(args)
+            except ValueError as exc:
+                print(f"错误，{exc}")
+                return 2
         module = self.load_module(script_path)
 
         if module and hasattr(module,'main'):

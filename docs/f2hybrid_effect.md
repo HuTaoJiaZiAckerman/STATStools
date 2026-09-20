@@ -15,11 +15,18 @@
 | `-i, --input` | 是 | 单性状聚合 Parquet 文件 |
 | `-o, --output` | 是 | 输出目录 |
 | `--trait_id` | 是 | 单个整数性状编号 |
+| `-t, --threads` | 否 | Polars 线程数，默认使用当前节点全部可见核心。超过可见核心数时自动降低 |
 
 ## 运行示例
 
 ```shell
 statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -o hybrid_effect --trait_id 1
+```
+
+指定线程数。
+
+```shell
+statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -o hybrid_effect --trait_id 1 --threads 72
 ```
 
 ## 比较规则
@@ -36,6 +43,8 @@ statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -o hybrid_
 ## 输出说明
 
 生成 trait_{trait_id}_hybrid_effect.parquet。hybrid_effect_raw 为原始表型尺度的纯合减杂合效应。hybrid_effect_z 为性状内标准化后的效应。输出同时保留两组的祖源状态、均值、标准差、样本量、有效性标记和状态说明。
+
+输出行顺序不作保证。需要特定顺序时，应在读取结果后按照窗口和比较字段排序。
 
 ## 样本量规则
 

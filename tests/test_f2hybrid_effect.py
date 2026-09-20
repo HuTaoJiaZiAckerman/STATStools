@@ -144,15 +144,17 @@ class StandardizationTests(unittest.TestCase):
 
 
 class HybridEffectTests(unittest.TestCase):
-    def test_one_ab_pair_produces_48_ordered_comparisons(self):
+    def test_one_ab_pair_produces_48_comparisons(self):
         result = hybrid.build_hybrid_effects(aggregation_rows().lazy()).collect()
         self.assertEqual(result.height, 48)
-        self.assertEqual(result["population"].head(6).to_list(), [
-            "all", "male", "female", "all", "male", "female",
-        ])
-        self.assertEqual(result["b_state"].unique(maintain_order=True).to_list(), [
-            "11", "01", "10", "00",
-        ])
+        self.assertEqual(
+            set(result["population"].unique().to_list()),
+            {"all", "male", "female"},
+        )
+        self.assertEqual(
+            set(result["b_state"].unique().to_list()),
+            {"11", "01", "10", "00"},
+        )
         self.assertEqual(result["comparison_id"].n_unique(), 16)
 
     def test_effect_is_homozygote_minus_heterozygote(self):

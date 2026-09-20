@@ -4,6 +4,7 @@
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -205,11 +206,7 @@ def build_hybrid_effects(data: pl.LazyFrame) -> pl.LazyFrame:
         "raw_effect_valid", "standardized_effect_valid",
         "hybrid_effect_raw", "hybrid_effect_z", "status",
     ]
-    return (
-        result
-        .sort(WINDOW_KEYS + ["b_order", "homo_order", "hetero_order", "population_order"])
-        .select(output_columns)
-    )
+    return result.select(output_columns)
 
 
 def report_result(output_path: Path) -> None:
@@ -238,12 +235,23 @@ def main() -> int:
     parser.add_argument("-i", "--input", required=True, help="单性状 f2aggregation Parquet 文件")
     parser.add_argument("-o", "--output", required=True, help="输出目录")
     parser.add_argument("--trait_id", required=True, type=int, help="本次分析的性状编号")
+    parser.add_argument(
+        "-t", "--threads", type=int, default=None,
+        help="Polars 线程数，默认使用当前节点全部可见核心",
+    )
     args = parser.parse_args()
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads 必须为正整数")
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
     configure_logging(output_dir, "f2hybrid_effect", f"trait{args.trait_id}")
     output_path = output_dir / f"trait_{args.trait_id}_hybrid_effect.parquet"
+    visible_threads = int(os.environ.get("STATSTOOLS_VISIBLE_THREADS", os.cpu_count() or 1))
+    requested_threads = args.threads if args.threads is not None else visible_threads
+    logger.info("请求线程数 %s", requested_threads)
+    logger.info("当前进程可见核心数 %s", visible_threads)
+    logger.info("Polars 实际线程数 %s", pl.thread_pool_size())
     try:
         if not input_path.exists():
             raise ValueError(f"输入文件不存在 {input_path}")
@@ -265,7 +273,7 @@ def main() -> int:
         if output_path.exists():
             output_path.unlink()
         build_hybrid_effects(data).sink_parquet(
-            output_path, compression="zstd", maintain_order=True
+            output_path, compression="zstd", maintain_order=False
         )
         logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
         report_result(output_path)
