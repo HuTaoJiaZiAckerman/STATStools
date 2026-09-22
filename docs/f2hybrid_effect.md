@@ -38,13 +38,13 @@ statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -o hybrid_
 * A11 减 A01
 * A11 减 A10
 
-每个 AB 配对共有 16 种祖源比较。总体、雄性和雌性分别计算，因此每个 AB 配对输出 48 行。comparison_id 使用 A00_vs_A01_B11 这样的名称。所有效应均按纯合均值减杂合均值计算。
+每个 AB 配对共有 16 种祖源比较。总体、雄性和雌性分别计算，因此每个 AB 配对输出 48 行。b_state、a_homo_state 和 a_hetero_state 共同标识一项比较。所有效应均按纯合均值减杂合均值计算。
 
 ## 输出说明
 
-生成 trait_{trait_id}_hybrid_effect.parquet。hybrid_effect_raw 为原始表型尺度的纯合减杂合效应。hybrid_effect_z 为性状内标准化后的效应。输出同时保留两组的祖源状态、均值、标准差、样本量、有效性标记和状态说明。
+生成 trait_{trait_id}_hybrid_effect.parquet。输出包括 22 个字段。hybrid_effect_raw 为原始表型尺度的纯合减杂合效应。hybrid_effect_z 为性状内标准化后的效应。输出同时保留三个组合祖源状态、两组均值、标准差、样本量和状态说明。
 
-输出行顺序不作保证。需要特定顺序时，应在读取结果后按照窗口和比较字段排序。
+结果依次按照 chra、windowa、chrb、windowb、b_state、a_homo_state、a_hetero_state 和 population 排序。
 
 ## 样本量规则
 

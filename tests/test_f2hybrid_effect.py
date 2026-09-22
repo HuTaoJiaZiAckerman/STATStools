@@ -155,20 +155,39 @@ class HybridEffectTests(unittest.TestCase):
             set(result["b_state"].unique().to_list()),
             {"11", "01", "10", "00"},
         )
-        self.assertEqual(result["comparison_id"].n_unique(), 16)
+        self.assertEqual(
+            result.select(["b_state", "a_homo_state", "a_hetero_state"])
+            .unique()
+            .height,
+            16,
+        )
+        self.assertEqual(result.columns, [
+            "chra", "windowa", "chrb", "windowb", "trait_id", "population",
+            "b_state", "a_homo_state", "a_hetero_state",
+            "homo_mean", "homo_sd", "homo_count", "homo_z_mean", "homo_z_sd",
+            "hetero_mean", "hetero_sd", "hetero_count", "hetero_z_mean", "hetero_z_sd",
+            "hybrid_effect_raw", "hybrid_effect_z", "status",
+        ])
+        sort_columns = [
+            "chra", "windowa", "chrb", "windowb",
+            "b_state", "a_homo_state", "a_hetero_state", "population",
+        ]
+        self.assertTrue(result.equals(result.sort(sort_columns)))
 
     def test_effect_is_homozygote_minus_heterozygote(self):
         result = hybrid.build_hybrid_effects(aggregation_rows().lazy()).collect()
         row = result.filter(
-            (pl.col("comparison_id") == "A00_vs_A01_B11")
+            (pl.col("b_state") == "11")
+            & (pl.col("a_homo_state") == "00")
+            & (pl.col("a_hetero_state") == "01")
             & (pl.col("population") == "all")
         ).row(0, named=True)
         self.assertEqual(row["homo_mean"], 3.0)
         self.assertEqual(row["hetero_mean"], 6.0)
         self.assertEqual(row["hybrid_effect_raw"], -3.0)
         self.assertEqual(row["hybrid_effect_z"], -1.5)
-        self.assertTrue(row["raw_effect_valid"])
-        self.assertTrue(row["standardized_effect_valid"])
+        self.assertNotIn("raw_effect_valid", result.columns)
+        self.assertNotIn("standardized_effect_valid", result.columns)
         self.assertEqual(row["status"], "valid")
 
     def test_small_and_absent_groups_are_retained(self):
@@ -182,7 +201,9 @@ class HybridEffectTests(unittest.TestCase):
         )
         result = hybrid.build_hybrid_effects(data.lazy()).collect()
         row = result.filter(
-            (pl.col("comparison_id") == "A00_vs_A01_B11")
+            (pl.col("b_state") == "11")
+            & (pl.col("a_homo_state") == "00")
+            & (pl.col("a_hetero_state") == "01")
             & (pl.col("population") == "all")
         ).row(0, named=True)
         self.assertEqual(row["homo_count"], 0)
@@ -190,7 +211,9 @@ class HybridEffectTests(unittest.TestCase):
         self.assertEqual(row["status"], "missing_homozygote")
 
         female = result.filter(
-            (pl.col("comparison_id") == "A11_vs_A10_B00")
+            (pl.col("b_state") == "00")
+            & (pl.col("a_homo_state") == "11")
+            & (pl.col("a_hetero_state") == "10")
             & (pl.col("population") == "female")
         ).row(0, named=True)
         self.assertEqual(female["homo_count"], 2)

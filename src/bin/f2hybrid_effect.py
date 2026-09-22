@@ -25,9 +25,9 @@ SUMMARY_COLUMNS = [
 MIN_GROUP_SIZE = 3
 
 POPULATIONS = [
-    ("all", "mean", "sd", "count", "z_mean", "z_sd", 0),
-    ("male", "male_mean", "male_sd", "male_count", "male_z_mean", "male_z_sd", 1),
-    ("female", "female_mean", "female_sd", "female_count", "female_z_mean", "female_z_sd", 2),
+    ("all", "mean", "sd", "count", "z_mean", "z_sd"),
+    ("male", "male_mean", "male_sd", "male_count", "male_z_mean", "male_z_sd"),
+    ("female", "female_mean", "female_sd", "female_count", "female_z_mean", "female_z_sd"),
 ]
 
 
@@ -44,11 +44,11 @@ def comparison_template() -> pl.DataFrame:
     b_states = [(1, 1), (0, 1), (1, 0), (0, 0)]
     homozygotes = [(0, 0), (1, 1)]
     heterozygotes = [(0, 1), (1, 0)]
-    for b_order, (b_p, b_m) in enumerate(b_states):
+    for b_p, b_m in b_states:
         b_state = f"{b_p}{b_m}"
-        for homo_order, (a_homo_p, a_homo_m) in enumerate(homozygotes):
+        for a_homo_p, a_homo_m in homozygotes:
             a_homo_state = f"{a_homo_p}{a_homo_m}"
-            for hetero_order, (a_hetero_p, a_hetero_m) in enumerate(heterozygotes):
+            for a_hetero_p, a_hetero_m in heterozygotes:
                 a_hetero_state = f"{a_hetero_p}{a_hetero_m}"
                 rows.append({
                     "b_p": b_p,
@@ -60,10 +60,6 @@ def comparison_template() -> pl.DataFrame:
                     "a_hetero_p": a_hetero_p,
                     "a_hetero_m": a_hetero_m,
                     "a_hetero_state": a_hetero_state,
-                    "comparison_id": f"A{a_homo_state}_vs_A{a_hetero_state}_B{b_state}",
-                    "b_order": b_order,
-                    "homo_order": homo_order,
-                    "hetero_order": hetero_order,
                 })
     return pl.DataFrame(rows).with_columns(
         pl.col(
@@ -107,19 +103,16 @@ def population_result(
     count_column: str,
     z_mean_column: str,
     z_sd_column: str,
-    population_order: int,
 ) -> pl.LazyFrame:
     identity_columns = WINDOW_KEYS + [
         "trait_id", "b_p", "b_m", "b_state",
         "a_homo_p", "a_homo_m", "a_homo_state",
         "a_hetero_p", "a_hetero_m", "a_hetero_state",
-        "comparison_id", "b_order", "homo_order", "hetero_order",
     ]
     result = joined.select(
         identity_columns
         + [
             pl.lit(population).alias("population"),
-            pl.lit(population_order, dtype=pl.Int8).alias("population_order"),
             pl.col(f"homo_{mean_column}").alias("homo_mean"),
             pl.col(f"homo_{sd_column}").alias("homo_sd"),
             pl.col(f"homo_{count_column}").fill_null(0).cast(pl.Int64).alias("homo_count"),
@@ -144,8 +137,6 @@ def population_result(
         & pl.col("hetero_z_mean").is_not_null()
     )
     return result.with_columns([
-        raw_valid.alias("raw_effect_valid"),
-        standardized_valid.alias("standardized_effect_valid"),
         pl.when(raw_valid)
         .then(pl.col("homo_mean") - pl.col("hetero_mean"))
         .otherwise(None)
@@ -198,15 +189,15 @@ def build_hybrid_effects(data: pl.LazyFrame) -> pl.LazyFrame:
         how="vertical",
     )
     output_columns = WINDOW_KEYS + [
-        "trait_id", "population", "b_p", "b_m", "b_state",
-        "a_homo_p", "a_homo_m", "a_homo_state",
-        "a_hetero_p", "a_hetero_m", "a_hetero_state", "comparison_id",
+        "trait_id", "population", "b_state", "a_homo_state", "a_hetero_state",
         "homo_mean", "homo_sd", "homo_count", "homo_z_mean", "homo_z_sd",
         "hetero_mean", "hetero_sd", "hetero_count", "hetero_z_mean", "hetero_z_sd",
-        "raw_effect_valid", "standardized_effect_valid",
         "hybrid_effect_raw", "hybrid_effect_z", "status",
     ]
-    return result.select(output_columns)
+    sort_columns = WINDOW_KEYS + [
+        "b_state", "a_homo_state", "a_hetero_state", "population",
+    ]
+    return result.select(output_columns).sort(sort_columns)
 
 
 def report_result(output_path: Path) -> None:
@@ -214,7 +205,7 @@ def report_result(output_path: Path) -> None:
         pl.scan_parquet(output_path)
         .select([
             pl.len().alias("rows"),
-            pl.col("standardized_effect_valid").sum().alias("valid"),
+            pl.col("hybrid_effect_z").is_not_null().sum().alias("valid"),
             (pl.col("status") != "valid").sum().alias("invalid"),
             pl.struct(WINDOW_KEYS).n_unique().alias("pairs"),
         ])
@@ -273,7 +264,7 @@ def main() -> int:
         if output_path.exists():
             output_path.unlink()
         build_hybrid_effects(data).sink_parquet(
-            output_path, compression="zstd", maintain_order=False
+            output_path, compression="zstd", maintain_order=True
         )
         logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
         report_result(output_path)
