@@ -55,6 +55,7 @@ def _configure_polars_threads(args):
     requested = _thread_argument(args)
     actual = min(requested if requested is not None else visible, visible)
     os.environ["POLARS_MAX_THREADS"] = str(actual)
+    os.environ["NUMBA_NUM_THREADS"] = str(actual)
     os.environ["STATSTOOLS_REQUESTED_THREADS"] = str(
         requested if requested is not None else visible
     )

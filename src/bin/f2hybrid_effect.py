@@ -12,6 +12,8 @@ from pathlib import Path
 import polars as pl
 
 from statstools.logging_utils import configure_logging
+from statstools.hybrid_permutation import run_permutation
+from numba import get_num_threads
 
 logger = logging.getLogger(__name__)
 
@@ -224,17 +226,28 @@ def main() -> int:
         description="计算固定 B 祖源背景下 A 的纯合减杂合表型效应"
     )
     parser.add_argument("-i", "--input", required=True, help="单性状 f2aggregation Parquet 文件")
+    parser.add_argument("-g", "--genotypes", required=True, help="个体级 f2double_locus Parquet 文件")
+    parser.add_argument("-p", "--pheno", required=True, help="原始表型 Excel 或文本文件")
     parser.add_argument("-o", "--output", required=True, help="输出目录")
     parser.add_argument("--trait_id", required=True, type=int, help="本次分析的性状编号")
     parser.add_argument(
         "-t", "--threads", type=int, default=None,
-        help="Polars 线程数，默认使用当前节点全部可见核心",
+        help="Polars 与 Numba 线程数，默认使用当前节点全部可见核心",
     )
+    parser.add_argument("--n_permutations", type=int, default=10000,
+                        help="随机置换次数，默认 10000。可穷举时自动穷举")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子，默认 42")
     args = parser.parse_args()
     if args.threads is not None and args.threads < 1:
         parser.error("--threads 必须为正整数")
 
+    if args.n_permutations < 1:
+        parser.error("--n_permutations 必须为正整数")
+    if not 0 <= args.seed <= 0xFFFFFFFF:
+        parser.error("--seed 必须为 0 到 4294967295 之间的整数")
     input_path = Path(args.input)
+    genotype_path = Path(args.genotypes)
+    phenotype_path = Path(args.pheno)
     output_dir = Path(args.output)
     configure_logging(output_dir, "f2hybrid_effect", f"trait{args.trait_id}")
     output_path = output_dir / f"trait_{args.trait_id}_hybrid_effect.parquet"
@@ -243,9 +256,11 @@ def main() -> int:
     logger.info("请求线程数 %s", requested_threads)
     logger.info("当前进程可见核心数 %s", visible_threads)
     logger.info("Polars 实际线程数 %s", pl.thread_pool_size())
+    logger.info("Numba 实际线程数 %s", get_num_threads())
     try:
-        if not input_path.exists():
-            raise ValueError(f"输入文件不存在 {input_path}")
+        for path in (input_path, genotype_path, phenotype_path):
+            if not path.is_file():
+                raise ValueError(f"输入文件不存在 {path}")
         data = pl.scan_parquet(input_path)
         validate_input(data.collect_schema())
         trait_ids = (
@@ -261,16 +276,26 @@ def main() -> int:
 
         logger.info("开始计算 trait_id=%s，最小组内样本量=%s", args.trait_id, MIN_GROUP_SIZE)
         started = time.time()
-        if output_path.exists():
-            output_path.unlink()
-        build_hybrid_effects(data).sink_parquet(
-            output_path, compression="zstd", maintain_order=True
-        )
-        logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
-        report_result(output_path)
-        return 0
+        effects_path = output_dir / f"trait_{args.trait_id}_hybrid_effect.effects.tmp.parquet"
+        result_path = output_dir / f"trait_{args.trait_id}_hybrid_effect.result.tmp.parquet"
+        try:
+            build_hybrid_effects(data).sink_parquet(
+                effects_path, compression="zstd", maintain_order=True
+            )
+            logger.info("表型效应计算完成，开始个体级置换检验")
+            run_permutation(
+                effects_path, genotype_path, phenotype_path, args.trait_id,
+                args.n_permutations, args.seed, result_path,
+            )
+            os.replace(result_path, output_path)
+            logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
+            report_result(output_path)
+            return 0
+        finally:
+            effects_path.unlink(missing_ok=True)
+            result_path.unlink(missing_ok=True)
     except Exception as exc:
-        logger.error("处理失败 %s", exc)
+        logger.exception("处理失败 %s", exc)
         return 1
 
 

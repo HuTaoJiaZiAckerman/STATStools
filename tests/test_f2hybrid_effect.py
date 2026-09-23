@@ -221,18 +221,41 @@ class HybridEffectTests(unittest.TestCase):
         self.assertIsNone(female["hybrid_effect_raw"])
         self.assertEqual(female["status"], "insufficient_both_groups")
 
-    def test_cli_writes_expected_file(self):
+    def test_cli_writes_effects_and_population_specific_p_values(self):
+        genotype_rows = []
+        phenotype_rows = []
+        f2_id = 100
+        for ap, am in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            for bp, bm in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                for sex in (1, 2):
+                    for replicate in range(3):
+                        f2_id += 1
+                        genotype_rows.append({
+                            "chra": 1, "windowa": 2, "chrb": 3, "windowb": 4,
+                            "allelea": ap, "peerallelea": am,
+                            "alleleb": bp, "peeralleleb": bm,
+                            "f2": f2_id, "sex": sex,
+                        })
+                        phenotype_rows.append({
+                            "f2": f2_id, "trait_id": 7,
+                            "trait_value": float(10 * ap + 3 * am + 2 * bp + bm
+                                                 + sex + replicate),
+                        })
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            genotype = root / "double_locus.parquet"
+            phenotype = root / "phenotype.tsv"
             source = root / "aggregation.parquet"
             output = root / "output"
-            aggregation_rows().write_parquet(source)
+            pl.DataFrame(genotype_rows).write_parquet(genotype)
+            frame = pd.DataFrame(phenotype_rows)
+            frame.to_csv(phenotype, sep="\t", index=False)
+            aggregation.aggregate_trait(genotype, frame, 7, source)
             original_argv = sys.argv
             sys.argv = [
-                "f2hybrid_effect",
-                "-i", str(source),
-                "-o", str(output),
-                "--trait_id", "7",
+                "f2hybrid_effect", "-i", str(source), "-g", str(genotype),
+                "-p", str(phenotype), "-o", str(output), "--trait_id", "7",
+                "--n_permutations", "30", "--seed", "42",
             ]
             try:
                 self.assertEqual(hybrid.main(), 0)
@@ -242,8 +265,47 @@ class HybridEffectTests(unittest.TestCase):
                 logging.getLogger().handlers.clear()
             result_path = output / "trait_7_hybrid_effect.parquet"
             self.assertTrue(result_path.exists())
-            self.assertEqual(pl.read_parquet(result_path).height, 48)
+            result = pl.read_parquet(result_path)
+            self.assertEqual(result.height, 48)
+            self.assertEqual(result.columns[-2:], ["p_value", "q_value"])
+            self.assertEqual(result["p_value"].null_count(), 0)
+            self.assertEqual(result["q_value"].null_count(), 0)
+            self.assertTrue((result["q_value"] >= result["p_value"]).all())
             self.assertEqual(len(list(output.glob("f2hybrid_effect_*.log"))), 1)
+
+    def test_exact_permutation_and_separate_fdr_families(self):
+        from statstools.hybrid_permutation import _exact_p, adjust_bh
+
+        values = np.arange(6, dtype=np.float64)
+        self.assertAlmostEqual(_exact_p(values, 3, -3.0, 20), 0.1)
+        p = np.array([0.01, 0.04, 0.02, 0.4])
+        population = np.array([0, 0, 1, 1], dtype=np.int8)
+        q = np.full(4, np.nan)
+        adjust_bh(p, population, q)
+        np.testing.assert_allclose(q, [0.02, 0.04, 0.04, 0.4])
+
+    def test_random_permutation_is_reproducible(self):
+        from statstools.hybrid_permutation import permutation_batch
+
+        matrix = np.zeros((2, 2, 16), dtype=np.int8)
+        matrix[0, 0, 8:] = 1
+        values = np.arange(16, dtype=np.float64)
+        indexes = np.array([0], dtype=np.int32)
+        zeros = np.array([0], dtype=np.int8)
+        ones = np.array([1], dtype=np.int8)
+        result_a = permutation_batch(
+            matrix, np.ones(16, dtype=np.int8), values, indexes, ones,
+            zeros, zeros, zeros, zeros, ones, zeros, zeros,
+            np.array([-8.0]), np.array([8]), np.array([8]), 200, 42, 0,
+        )
+        result_b = permutation_batch(
+            matrix, np.ones(16, dtype=np.int8), values, indexes, ones,
+            zeros, zeros, zeros, zeros, ones, zeros, zeros,
+            np.array([-8.0]), np.array([8]), np.array([8]), 200, 42, 0,
+        )
+        self.assertEqual(result_a[1][0], 0)
+        self.assertEqual(result_a[2][0], 0)
+        self.assertEqual(result_a[0][0], result_b[0][0])
 
 
 if __name__ == "__main__":
