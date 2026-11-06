@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 WINDOWS = ["chra", "windowa", "chrb", "windowb"]
 GENOTYPES = ["allelea", "peerallelea", "alleleb", "peeralleleb"]
 EFFECTS = ("delta_m", "male_delta_m", "female_delta_m")
+POPULATION_MEANS = {
+    "delta_m": "population_mean",
+    "male_delta_m": "male_population_mean",
+    "female_delta_m": "female_population_mean",
+}
 ROUTES = {
     "paternal": ("allelea", ("peerallelea", "alleleb", "peeralleleb")),
     "maternal": ("peerallelea", ("allelea", "alleleb", "peeralleleb")),
@@ -244,6 +249,8 @@ def validate_ahf(file, route, trait_id, effect):
         raise ValueError(f"{file} 缺少列 {sorted(missing)}")
     if "p_value" in names or "adjusted_p_value" in names:
         raise ValueError("AHF 输入已包含置换结果列")
+    if f"{effect}_raw" in names and POPULATION_MEANS[effect] not in names:
+        raise ValueError(f"AHF 标准化效应缺少分母列 {POPULATION_MEANS[effect]}")
     return source, counts[effect]
 
 
@@ -254,6 +261,10 @@ def calculate_route(file, route, trait_id, effect, keys, genotypes, sexes, value
     started = time.monotonic()
     last_report = started
     needed = WINDOWS + GENOTYPES + ["trait_id", "flip_type", effect] + list(count_columns)
+    mean_column = POPULATION_MEANS[effect]
+    standardized = mean_column in source.schema_arrow.names
+    if standardized:
+        needed.append(mean_column)
     for batch in source.iter_batches(batch_size=32768, columns=needed):
         if np.any(column_numpy(batch, "trait_id", np.int64) != trait_id):
             raise ValueError(f"{file} 的性状编号与参数不一致")
@@ -266,6 +277,14 @@ def calculate_route(file, route, trait_id, effect, keys, genotypes, sexes, value
         fixed_bp = column_numpy(batch, "alleleb", np.int8)
         fixed_bm = column_numpy(batch, "peeralleleb", np.int8)
         observed = column_numpy(batch, effect, np.float64, allow_null=True)
+        if standardized:
+            # Undo the fixed scale for the raw-phenotype consistency check.
+            # Scaling all permutations by the same factor gives the same p value.
+            scale = column_numpy(batch, mean_column, np.float64, allow_null=True)
+            invalid = ~np.isfinite(scale) | (scale == 0)
+            if np.any(np.isfinite(observed) & invalid):
+                raise ValueError("标准化 AHF 效应的群体均值必须有限且非零")
+            observed = observed * scale
         expected_zero = column_numpy(batch, count_columns[0], np.int64)
         expected_one = column_numpy(batch, count_columns[1], np.int64)
         route_code = 0 if route == "paternal" else 1

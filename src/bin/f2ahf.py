@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 """计算父本和母本相位的祖先单倍型翻转效应。
 
-For both routes the difference direction is state 0 minus state 1. Counts are
-retained when either state is absent. Phenotypic differences are reported only
-when both compared states contain at least three individuals.
+For both routes, signed phenotype differences are scaled by the corresponding
+all/male/female population mean from the original phenotype file. Raw differences
+are retained separately. Signed count differences are scaled by the corresponding
+trait-specific population size as delta_f (genotype-frequency contrast), with
+delta_n retained as a compatibility alias and raw count differences retained.
+The unflipped A ancestry is fixed during grouping and reported as anchor_state.
+No absolute values are taken.
+Phenotypic differences require at least three individuals in both states.
 """
 
 import argparse
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -16,6 +22,7 @@ from pathlib import Path
 import polars as pl
 
 from statstools.logging_utils import configure_logging
+from statstools.phenotype_utils import read_trait_phenotype, phenotype_means
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +70,29 @@ def valid_delta(mean_0: str, mean_1: str, count_0: str, count_1: str, alias: str
     )
 
 
+def normalized_delta(raw_column: str, denominator: float, alias: str) -> pl.Expr:
+    """Scale a signed contrast by a fixed trait-specific population reference."""
+    if not math.isfinite(denominator) or denominator == 0:
+        return pl.lit(None, dtype=pl.Float64).alias(alias)
+    return (pl.col(raw_column) / pl.lit(denominator, dtype=pl.Float64)).alias(alias)
+
+
 def build_flip_result(
     data: pl.LazyFrame,
     flip_type: str,
     flipped_col: str,
     fixed_genotypes: list[str],
+    population_means: dict[str, float],
+    population_counts: dict[str, int],
 ) -> pl.LazyFrame:
     """Build one route while retaining backgrounds with one observed state."""
+    for population in ("all", "male", "female"):
+        size = population_counts[population]
+        if not isinstance(size, int) or size < 0:
+            raise ValueError(f"{population} 群体人数必须为非负整数")
+    anchor_col = "peerallelea" if flipped_col == "allelea" else "allelea"
+    if anchor_col not in fixed_genotypes:
+        raise ValueError(f"翻转计算必须固定 A 窗口的另一条祖源拷贝 {anchor_col}")
     group_keys = WINDOW_KEYS + ["trait_id"] + fixed_genotypes
     aggregate = [
         state_value("mean", flipped_col, 0, "mean_0"),
@@ -94,34 +117,57 @@ def build_flip_result(
 
     result = data.group_by(group_keys).agg(aggregate)
     result = result.with_columns([
+        pl.col(anchor_col).alias("anchor_state"),
         pl.lit(0, dtype=pl.Int8).alias(flipped_col),
         pl.lit(0, dtype=pl.Int8).alias("state_0"),
         pl.lit(1, dtype=pl.Int8).alias("state_1"),
         pl.lit(flip_type).alias("flip_type"),
-        valid_delta("mean_0", "mean_1", "count_0", "count_1", "delta_m"),
-        (pl.col("count_0") - pl.col("count_1")).alias("delta_n"),
+        valid_delta("mean_0", "mean_1", "count_0", "count_1", "delta_m_raw"),
+        (pl.col("count_0") - pl.col("count_1")).alias("delta_n_raw"),
         valid_delta(
             "male_mean_0", "male_mean_1", "male_count_0", "male_count_1",
-            "male_delta_m",
+            "male_delta_m_raw",
         ),
-        (pl.col("male_count_0") - pl.col("male_count_1")).alias("male_delta_n"),
+        (pl.col("male_count_0") - pl.col("male_count_1")).alias("male_delta_n_raw"),
         valid_delta(
             "female_mean_0", "female_mean_1",
-            "female_count_0", "female_count_1", "female_delta_m",
+            "female_count_0", "female_count_1", "female_delta_m_raw",
         ),
-        (pl.col("female_count_0") - pl.col("female_count_1")).alias("female_delta_n"),
+        (pl.col("female_count_0") - pl.col("female_count_1")).alias("female_delta_n_raw"),
+    ])
+
+    result = result.with_columns([
+        pl.lit(population_means["all"], dtype=pl.Float64).alias("population_mean"),
+        pl.lit(population_means["male"], dtype=pl.Float64).alias("male_population_mean"),
+        pl.lit(population_means["female"], dtype=pl.Float64).alias("female_population_mean"),
+        normalized_delta("delta_m_raw", population_means["all"], "delta_m"),
+        normalized_delta("male_delta_m_raw", population_means["male"], "male_delta_m"),
+        normalized_delta("female_delta_m_raw", population_means["female"], "female_delta_m"),
+        pl.lit(population_counts["all"], dtype=pl.Int64).alias("population_size"),
+        pl.lit(population_counts["male"], dtype=pl.Int64).alias("male_population_size"),
+        pl.lit(population_counts["female"], dtype=pl.Int64).alias("female_population_size"),
+        normalized_delta("delta_n_raw", population_counts["all"], "delta_n"),
+        normalized_delta("male_delta_n_raw", population_counts["male"], "male_delta_n"),
+        normalized_delta("female_delta_n_raw", population_counts["female"], "female_delta_n"),
+    ])
+    result = result.with_columns([
+        pl.col(f"{prefix}delta_n").alias(f"{prefix}delta_f")
+        for prefix in ("", "male_", "female_")
     ])
 
     output_columns = WINDOW_KEYS + GENO_CODES + [
-        "trait_id", "flip_type", "state_0", "state_1",
+        "trait_id", "flip_type", "anchor_state", "state_0", "state_1",
         "mean_0", "sd_0", "count_0", "mean_1", "sd_1", "count_1",
-        "delta_m", "delta_n",
+        "delta_m", "delta_f", "delta_n", "delta_m_raw", "population_mean",
+        "delta_n_raw", "population_size",
         "male_mean_0", "male_sd_0", "male_count_0",
         "male_mean_1", "male_sd_1", "male_count_1",
-        "male_delta_m", "male_delta_n",
+        "male_delta_m", "male_delta_f", "male_delta_n", "male_delta_m_raw", "male_population_mean",
+        "male_delta_n_raw", "male_population_size",
         "female_mean_0", "female_sd_0", "female_count_0",
         "female_mean_1", "female_sd_1", "female_count_1",
-        "female_delta_m", "female_delta_n",
+        "female_delta_m", "female_delta_f", "female_delta_n", "female_delta_m_raw", "female_population_mean",
+        "female_delta_n_raw", "female_population_size",
     ]
     return result.select(output_columns).sort(WINDOW_KEYS + GENO_CODES)
 
@@ -152,6 +198,7 @@ def main() -> None:
         description="计算单个性状的父本和母本祖先单倍型翻转结果"
     )
     parser.add_argument("-i", "--input", required=True, help="单性状聚合 Parquet 文件")
+    parser.add_argument("-p", "--pheno", required=True, help="生成该聚合文件的同一份原始表型文件")
     parser.add_argument("-o", "--output", required=True, help="输出目录")
     parser.add_argument("--trait_id", required=True, type=int, help="本次分析的性状编号")
     args = parser.parse_args()
@@ -177,13 +224,31 @@ def main() -> None:
                 f"输入文件中的 trait_id 为 {sorted(trait_ids)}，与参数 {args.trait_id} 不一致"
             )
 
+        pheno_path = Path(args.pheno)
+        if not pheno_path.is_file():
+            raise ValueError(f"表型文件不存在 {pheno_path}")
+        phenotype = read_trait_phenotype(pheno_path, args.trait_id)
+        population_means, population_counts, sex_source = phenotype_means(phenotype)
+        logger.info("标准化分母来自原始表型文件；性别来源：%s", sex_source)
+        for population in ("all", "male", "female"):
+            value = population_means[population]
+            logger.info("  %s 群体均值 %s，人数 %s", population, value, population_counts[population])
+            if not math.isfinite(value) or value == 0:
+                logger.warning("  %s 群体均值不可用，标准化 delta_m 记为空；保留原始差值与人数差", population)
+            if population_counts[population] == 0:
+                logger.warning("  %s 群体人数为零，标准化 delta_n 记为空；保留原始人数差", population)
+
         paternal = build_flip_result(
             data, "paternal", "allelea",
             ["peerallelea", "alleleb", "peeralleleb"],
+            population_means,
+            population_counts,
         )
         maternal = build_flip_result(
             data, "maternal", "peerallelea",
             ["allelea", "alleleb", "peeralleleb"],
+            population_means,
+            population_counts,
         )
         paternal_path = output_dir / f"trait_{args.trait_id}_paternal.parquet"
         maternal_path = output_dir / f"trait_{args.trait_id}_maternal.parquet"
