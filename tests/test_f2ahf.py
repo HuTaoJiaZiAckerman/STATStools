@@ -236,6 +236,35 @@ class AhfTests(unittest.TestCase):
                     ["alleleb", "peeralleleb"], MEANS, COUNTS,
                 )
 
+    def test_long_output_preserves_every_population_value_and_b_state(self):
+        identity = ahf.WINDOW_KEYS + ahf.GENO_CODES + [
+            "trait_id", "flip_type", "anchor_state", "state_0", "state_1",
+        ]
+        columns = [
+            "mean_0", "sd_0", "count_0", "mean_1", "sd_1", "count_1",
+            "delta_m", "delta_f", "delta_n", "delta_m_raw", "population_mean",
+            "delta_n_raw", "population_size",
+        ]
+        for route in ("paternal", "maternal"):
+            data = aggregate_rows().filter(pl.col("chra") == 1)
+            data = data.filter(~((pl.col("allelea") == 1) & (pl.col("peerallelea") == 1)))
+            data = data.drop("alleleb", "peeralleleb").join(
+                pl.DataFrame({"alleleb": [0, 0, 1, 1], "peeralleleb": [0, 1, 0, 1]}),
+                how="cross",
+            )
+            wide = result(data, route, means={"all": 0.0, "male": 26.0, "female": 18.0})
+            rows = ahf.population_long_result(wide.lazy()).collect()
+            self.assertEqual(rows.height, wide.height * 3)
+            self.assertEqual(set(rows["b_state"]), {"00", "01", "10", "11"})
+            self.assertEqual(set(rows["population"]), {"all", "male", "female"})
+            self.assertFalse(any(name.startswith(("male_", "female_")) for name in rows.columns))
+            for population, prefix in (("all", ""), ("male", "male_"), ("female", "female_")):
+                observed = rows.filter(pl.col("population") == population).select(identity + columns)
+                expected = wide.select(
+                    identity + [pl.col(f"{prefix}{column}").alias(column) for column in columns]
+                )
+                self.assertTrue(observed.equals(expected))
+
     def test_cli_requires_phenotypes_and_writes_normalized_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -249,7 +278,11 @@ class AhfTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             for route in ("paternal", "maternal"):
                 rows = pl.read_parquet(root / f"trait_21_{route}.parquet")
-                self.assertTrue(rows.equals(result(aggregate_rows(), route)))
+                expected = ahf.population_long_result(
+                    result(aggregate_rows(), route).lazy()
+                ).collect()
+                self.assertTrue(rows.equals(expected))
+                ahf.report_result(route, root / f"trait_21_{route}.parquet")
 
     def test_permutation_p_values_are_identical_for_new_and_old_effect_scales(self):
         genotype, phenotype = individual_data()

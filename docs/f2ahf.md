@@ -27,7 +27,16 @@ statstools f2ahf -i aggregation/trait_1_aggregation.parquet -p phenotype.tsv -o 
 
 ## 输出说明
 
-生成 trait_{trait_id}_paternal.parquet 和 trait_{trait_id}_maternal.parquet。对于 all、male、female 各群体 p：
+生成 trait_{trait_id}_paternal.parquet 和 trait_{trait_id}_maternal.parquet，命令参数和文件名不变。两个文件均为长格式，每行对应一个 A–B 背景、一个 anchor 和一个群体。
+
+* `population`：`all`、`male` 或 `female`。
+* `b_state`：将 `alleleb`（B 父源）与 `peeralleleb`（B 母源）依次拼接成字符串 `"00"`、`"01"`、`"10"`、`"11"`。
+* `chra`、`windowa`、`chrb`、`windowb`、`trait_id`、`flip_type`、`anchor_state` 和原祖源字段继续保留。
+* 三个人群共用 `mean_0`、`sd_0`、`count_0`、`mean_1`、`sd_1`、`count_1`、`delta_m`、`delta_f`、`delta_n`、`delta_m_raw`、`delta_n_raw`、`population_mean`、`population_size` 字段，由 `population` 指定所属群体。输出不再包含 `male_`、`female_` 前缀的指标列。
+
+每个原宽表记录对应三条长表记录，包括效应为空的群体；不新增任何过滤条件。下游无需再 unpivot。行数增加不代表效应数量或计算定义发生变化，不能保证所有规模的扫描聚合都具有固定内存占用。
+
+对于 all、male、female 各群体 p：
 
 ```text
 delta_m_raw[p] = mean_0[p] - mean_1[p]
@@ -37,9 +46,9 @@ delta_f[p]     = delta_n_raw[p] / population_size[p]
 delta_n[p]     = delta_f[p]  # 兼容已有下游流程的旧字段
 ```
 
-总体使用 `delta_m_raw`、`delta_m`、`population_mean`；雄性和雌性字段分别带 `male_` 和 `female_` 前缀。父本与母本结果使用完全相同的性状群体分母。该分母来自原始表型文件的唯一有效个体，不是当前 A–B 组合的局部均值，也不通过反复汇总窗口记录计算。
+三个群体分别通过 `population` 标识，使用相同的 `delta_m_raw`、`delta_m`、`population_mean` 字段名。父本与母本结果使用完全相同的性状群体分母。该分母来自原始表型文件的唯一有效个体，不是当前 A–B 组合的局部均值，也不通过反复汇总窗口记录计算。
 
-人数标准化的总体字段为 `delta_n_raw`、`delta_f`、`population_size`，保留 `delta_n` 作为 `delta_f` 的兼容别名，雄性和雌性分别带 `male_`、`female_` 前缀。`population_size` 来自同一表型文件筛选指定性状、排除无效值并对个体去重后的计数；不是固定的全群体名义人数，不是窗口行数，也不是当前背景中的 `count_0 + count_1`。两条路径使用相同的群体人数分母。`delta_f` 表示状态 0 与状态 1 在性状有效群体中的比例之差；它包含该固定背景在群体中的代表性，不等同于在该背景内归一化的条件比例差。
+人数标准化字段为 `delta_n_raw`、`delta_f`、`population_size`，保留 `delta_n` 作为 `delta_f` 的数值别名，各群体通过 `population` 标识。`population_size` 来自同一表型文件筛选指定性状、排除无效值并对个体去重后的计数；不是固定的全群体名义人数，不是窗口行数，也不是当前背景中的 `count_0 + count_1`。两条路径使用相同的群体人数分母。`delta_f` 表示状态 0 与状态 1 在性状有效群体中的比例之差；它包含该固定背景在群体中的代表性，不等同于在该背景内归一化的条件比例差。
 
 `delta_f`（以及兼容字段 `delta_n`）为无量纲浮点数，`delta_n_raw` 和各组 count 保留整数人数。群体人数为零时，标准化人数差为空，原始人数差仍保留；缺少一种祖先状态时仍可输出人数差，不套用 delta_m 的最小三人限制。
 
@@ -47,7 +56,7 @@ delta_n[p]     = delta_f[p]  # 兼容已有下游流程的旧字段
 
 **版本变化：最初结果的 delta_m、delta_n 分别是原始均值差和原始人数差；新结果二者都为对应群体分母标准化后的差，原始差值分别保存在 delta_m_raw、delta_n_raw 中。旧结果不会自动更新，跨性状比较前须按新命令重新生成。**
 
-更新后的 f2permutation_test 根据群体均值字段识别新尺度，恢复原始尺度进行一致性检查和双侧置换检验；同时兼容未标准化的旧结果。固定分母不会改变同一对比的双侧置换 p 值。
+**输出布局变化：本版本默认输出长表；旧宽表中的 `male_delta_m`、`female_delta_m` 等指标现在位于 `population="male"`、`population="female"` 的行中。已有文件不会自动转换，须重新运行 f2ahf 生成新布局；原聚合输入可继续使用。本次仅调整 f2ahf 的输出，不修改其他工具。**
 
 ## 固定 anchor 与比较方向
 
@@ -64,7 +73,7 @@ delta_n[p]     = delta_f[p]  # 兼容已有下游流程的旧字段
 
 输出中的 `state_0=0`、`state_1=1` 标识被比较的目标拷贝状态；被翻转的基因型列填 0 是参考编码，不表示最终状态，不能用它代替 `anchor_state`。
 
-新增 `delta_f`、`male_delta_f`、`female_delta_f` 与对应旧 `delta_n` 列数值完全相同，保留正负号。旧输出没有这些新字段及显式 `anchor_state`，需重新运行本工具生成；既有聚合输入仍可使用。
+每行的 `delta_f` 与同一行的 `delta_n` 数值完全相同，保留正负号；所属群体由 `population` 指定。`anchor_state` 始终表示 A 窗口未翻转的祖源拷贝。
 
 ## 注意事项
 

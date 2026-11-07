@@ -8,6 +8,7 @@ are retained separately. Signed count differences are scaled by the correspondin
 trait-specific population size as delta_f (genotype-frequency contrast), with
 delta_n retained as a compatibility alias and raw count differences retained.
 The unflipped A ancestry is fixed during grouping and reported as anchor_state.
+Output is long format with explicit population and ordered B ancestry state.
 No absolute values are taken.
 Phenotypic differences require at least three individuals in both states.
 """
@@ -172,19 +173,54 @@ def build_flip_result(
     return result.select(output_columns).sort(WINDOW_KEYS + GENO_CODES)
 
 
+def population_long_result(result: pl.LazyFrame) -> pl.LazyFrame:
+    """Expose existing estimates in one shared schema for all three populations."""
+    identity_columns = WINDOW_KEYS + GENO_CODES + [
+        "trait_id", "flip_type", "anchor_state", "state_0", "state_1", "b_state",
+    ]
+    population_columns = [
+        "mean_0", "sd_0", "count_0", "mean_1", "sd_1", "count_1",
+        "delta_m", "delta_f", "delta_n", "delta_m_raw", "population_mean",
+        "delta_n_raw", "population_size",
+    ]
+    result = result.with_columns(
+        pl.concat_str(
+            pl.col("alleleb").cast(pl.String),
+            pl.col("peeralleleb").cast(pl.String),
+            separator="",
+        ).alias("b_state")
+    )
+    return pl.concat([
+        result.select(
+            *identity_columns,
+            pl.lit(population).alias("population"),
+            *[
+                pl.col(f"{prefix}{column}").alias(column)
+                for column in population_columns
+            ],
+        )
+        for population, prefix in (("all", ""), ("male", "male_"), ("female", "female_"))
+    ], how="vertical")
+
+
 def write_result(result: pl.LazyFrame, output_path: Path) -> None:
     if output_path.exists():
         output_path.unlink()
-    result.sink_parquet(output_path, compression="zstd", maintain_order=True)
+    population_long_result(result).sink_parquet(
+        output_path, compression="zstd", maintain_order=True,
+    )
 
 
 def report_result(label: str, output_path: Path) -> None:
     scan = pl.scan_parquet(output_path)
     counts = scan.select([
         pl.len().alias("rows"),
-        pl.col("delta_m").is_not_null().sum().alias("valid_delta_m"),
-        pl.col("male_delta_m").is_not_null().sum().alias("valid_male_delta_m"),
-        pl.col("female_delta_m").is_not_null().sum().alias("valid_female_delta_m"),
+        ((pl.col("population") == "all") & pl.col("delta_m").is_not_null())
+        .sum().alias("valid_delta_m"),
+        ((pl.col("population") == "male") & pl.col("delta_m").is_not_null())
+        .sum().alias("valid_male_delta_m"),
+        ((pl.col("population") == "female") & pl.col("delta_m").is_not_null())
+        .sum().alias("valid_female_delta_m"),
     ]).collect(engine="streaming").row(0, named=True)
     logger.info("%s 输出文件 %s", label, output_path)
     logger.info("  结果行数 %s", f"{counts['rows']:,}")
