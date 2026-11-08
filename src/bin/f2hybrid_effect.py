@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""计算固定 B 祖源背景下 A 的纯合减杂合表型效应，并输出除以群体均值后的条件效应。"""
+"""计算固定 B 祖源背景下 A 的纯合减杂合表型效应。
+
+标准化分母仅使用基因型与有效表型按 f2 匹配后的唯一个体。
+"""
 
 import argparse
 import logging
@@ -36,6 +39,57 @@ POPULATIONS = [
     ("male", "male_mean", "male_sd", "male_count", "male_z_mean", "male_z_sd"),
     ("female", "female_mean", "female_sd", "female_count", "female_z_mean", "female_z_sd"),
 ]
+
+
+def matched_population_reference(
+    pheno_path: Path,
+    genotype_path: Path,
+    trait_id: int,
+) -> tuple[dict[str, float], dict[str, int], str]:
+    """Use the same unique phenotype/genotype intersection as f2aggregation."""
+    if not genotype_path.is_file():
+        raise ValueError(f"基因型文件不存在 {genotype_path}")
+    phenotype = read_trait_phenotype(pheno_path, trait_id)
+    genotype_scan = pl.scan_parquet(genotype_path)
+    missing = {"f2", "sex"} - set(genotype_scan.collect_schema().names())
+    if missing:
+        raise ValueError(f"基因型输入缺少必要列 {sorted(missing)}")
+    individual_sex = (
+        genotype_scan.select(["f2", "sex"])
+        .unique()
+        .group_by("f2")
+        .agg([
+            pl.col("sex").n_unique().alias("sex_count"),
+            pl.col("sex").first().alias("sex"),
+        ])
+        .collect(engine="streaming")
+    )
+    conflicts = individual_sex.filter(pl.col("sex_count") != 1)
+    if conflicts.height:
+        examples = conflicts.get_column("f2").head(5).to_list()
+        raise ValueError(f"同一个体存在多个性别编码。个体示例 {examples}")
+    invalid_sex = individual_sex.filter(
+        pl.col("sex").is_null() | ~pl.col("sex").is_in([1, 2])
+    )
+    if invalid_sex.height:
+        examples = invalid_sex.select(["f2", "sex"]).head(5).rows()
+        raise ValueError(f"性别编码必须为 1 或 2。异常示例 {examples}")
+    sex_by_id = dict(zip(
+        individual_sex.get_column("f2").to_list(),
+        individual_sex.get_column("sex").to_list(),
+    ))
+    phenotype_ids = set(phenotype["f2"].tolist())
+    matched_ids = phenotype_ids & set(sex_by_id)
+    logger.info("  有效表型个体数 %s", len(phenotype_ids))
+    logger.info("  基因型个体数 %s", len(sex_by_id))
+    logger.info("  成功匹配基因型的个体数 %s", len(matched_ids))
+    logger.info("  没有基因型而被排除的表型个体数 %s", len(phenotype_ids - matched_ids))
+    if not matched_ids:
+        raise ValueError("指定性状没有任何个体能够匹配基因型数据")
+    phenotype = phenotype.loc[phenotype["f2"].isin(matched_ids)].copy()
+    phenotype["sex"] = phenotype["f2"].map(sex_by_id)
+    means, counts, _ = phenotype_means(phenotype)
+    return means, counts, "基因型文件的 sex 列"
 
 
 def validate_input(schema: pl.Schema) -> None:
@@ -255,6 +309,10 @@ def main() -> int:
     )
     parser.add_argument("-i", "--input", required=True, help="单性状 f2aggregation Parquet 文件")
     parser.add_argument("-p", "--pheno", required=True, help="生成该聚合文件的同一份表型文件")
+    parser.add_argument(
+        "-g", "--genotypes", required=True,
+        help="生成聚合输入时使用的同一份双窗口基因型 Parquet，须含 f2 和 sex 列",
+    )
     parser.add_argument("-o", "--output", required=True, help="输出目录")
     parser.add_argument("--trait_id", required=True, type=int, help="本次分析的性状编号")
     parser.add_argument(
@@ -293,9 +351,10 @@ def main() -> int:
         pheno_path = Path(args.pheno)
         if not pheno_path.is_file():
             raise ValueError(f"表型文件不存在 {pheno_path}")
-        phenotype_frame = read_trait_phenotype(pheno_path, args.trait_id)
-        population_means, population_counts, sex_source = phenotype_means(phenotype_frame)
-        logger.info("表型均值来源 %s", sex_source)
+        population_means, population_counts, sex_source = matched_population_reference(
+            pheno_path, Path(args.genotypes), args.trait_id,
+        )
+        logger.info("标准化分母来自基因型与有效表型的交集；性别来源：%s", sex_source)
         for name in ("all", "male", "female"):
             mean_value = population_means[name]
             logger.info(
