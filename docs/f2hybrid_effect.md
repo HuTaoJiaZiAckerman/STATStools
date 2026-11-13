@@ -6,9 +6,9 @@
 
 ## 输入要求
 
-需要两份文件：单性状 f2aggregation Parquet，以及生成该聚合文件时使用的同一份表型文件。聚合输入应包含总体、雄性和雌性的原始统计量与标准化统计量。表型文件用于计算分母，支持 xls、xlsx、xlsm、txt、md 和 tsv。
+需要三份文件：单性状 f2aggregation Parquet、生成该聚合文件时使用的同一份表型文件，以及同一份双窗口基因型 Parquet（`-g`，须含 `f2` 和 `sex`）。聚合输入应包含总体、雄性和雌性的原始统计量与标准化统计量。表型文件用于计算分母，支持 xls、xlsx、xlsm、txt、md 和 tsv。
 
-表型文件必须包含 f2、trait_id 和 trait_value 三列。若另有 sex 列且取值为 1 或 2，则直接使用；没有 sex 列时按 f2 编号奇偶推断，奇数记 1、偶数记 2，与 f2double_locus 的规则一致。
+表型文件必须包含 f2、trait_id 和 trait_value 三列。筛选指定性状，排除非有限表型，每个个体保留第一条有效记录，再按 f2 与基因型取交集。两个效应工具均以基因型的 sex 为准（1=雄性、2=雌性），表型文件中的性别不覆盖它。共用表型函数的读取、筛选、去重、连接与统计使用 Polars；xlsx/xlsm 使用 Polars 的 openpyxl 引擎，xls 使用 xlrd 解码后交给 Polars 处理，沿用项目已有依赖。
 
 ## 参数表
 
@@ -16,20 +16,22 @@
 | --- | --- | --- |
 | `-i, --input` | 是 | 单性状聚合 Parquet 文件 |
 | `-p, --pheno` | 是 | 生成该聚合文件的同一份表型文件 |
+| `-g, --genotypes` | 是 | 同一份双窗口基因型 Parquet，含 f2、sex |
 | `-o, --output` | 是 | 输出目录 |
 | `--trait_id` | 是 | 单个整数性状编号 |
 | `-t, --threads` | 否 | Polars 线程数，默认使用当前节点全部可见核心。超过可见核心数时自动降低 |
+| `--window_batch_size` | 否 | 每批 A 窗口数，默认 32，必须为正整数 |
 
 ## 运行示例
 
 ```shell
-statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenotype.xlsx -o hybrid_effect --trait_id 1
+statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenotype.xlsx -g f2double_locus_1Mb.parquet -o hybrid_effect --trait_id 1
 ```
 
 指定线程数。
 
 ```shell
-statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenotype.xlsx -o hybrid_effect --trait_id 1 --threads 72
+statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenotype.xlsx -g f2double_locus_1Mb.parquet -o hybrid_effect --trait_id 1 --threads 72 --window_batch_size 32
 ```
 
 ## 比较规则
@@ -50,7 +52,7 @@ statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenoty
 * hybrid_effect_raw = μ_homo − μ_hetero
 * hybrid_effect_cond = (μ_homo − μ_hetero) / μ
 
-μ 取该性状中该群体全部有表型个体的均值，不考虑基因型，因此对同一性状、同一群体是一个常数。总体、雄性和雌性各用各自的 μ。除以 μ 之后得到相对整体表型水平的条件效应，可以在不同 B 层、不同窗口和不同性状之间比较。hybrid_effect_z 的分母是标准差，与本列不同，两者不能混用。
+μ 取该性状中该群体同时具有有效表型和基因型的唯一个体的表型均值，不按局部祖源状态另行计算，因此对同一性状、同一群体是一个常数。总体、雄性和雌性各用各自的 μ。除以 μ 之后得到相对整体表型水平的条件效应，可以在不同 B 层、不同窗口和不同性状之间比较。hybrid_effect_z 的分母是标准差，与本列不同，两者不能混用。
 
 μ 非有限或等于 0 时，hybrid_effect_cond 全部记为缺失并写入警告日志，其余计算继续进行。
 
@@ -69,3 +71,11 @@ statstools f2hybrid_effect -i aggregation/trait_1_aggregation.parquet -p phenoty
 ## 日志
 
 运行信息同时写入终端和输出目录中的日志文件。日志记录三个群体的表型均值、各自人数和性别来源，并汇总有效条件效应数与 AB 配对数。
+
+## 分批计算与内存
+
+按 A 染色体与实际 A 窗口排序，每批最多 `--window_batch_size` 个 A 窗口。每个 A 的全部 B 配对和祖源状态保留在同一批。每批只读取必要列，在批内生成 16 个对比、连接统计量、展开三个人群并排序，直接写出临时 Parquet。随后通过 Polars 流式合成单个最终文件，不对全量展开结果执行 collect 或全局排序。各批按 A 坐标递增排列，保持原排序规则。AB 配对总数在各批内计数后相加，日志不再对整个展开文件执行高基数去重。
+
+临时目录 `.f2hybrid_parts_*` 位于输出目录，正常完成或可捕获异常后清理；强制终止可能残留。分片和合成文件同时存在，需预留临时磁盘空间，合成阶段可能接近新结果大小的两倍（已有结果另计）。合成成功后才替换原结果。
+
+批大小控制窗口数，不是严格的内存字节上限，也不改变分析窗口大小。每个 A 的配对多时，可将批大小降为 8 或 16。过滤可下推到 Parquet；输入排序和行组统计决定实际读取量，较小批次可能增加 I/O。线程数在导入 Polars 前配置，线程增多也可能增加缓冲内存。

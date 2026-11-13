@@ -18,12 +18,24 @@ import logging
 import math
 import sys
 import time
+import tempfile
 from pathlib import Path
+
+from statstools import _configure_polars_threads, _visible_cpu_count
+
+# Configure the native thread pool before importing Polars, also for direct execution.
+if __name__ == "__main__":
+    try:
+        _configure_polars_threads(sys.argv[1:])
+    except ValueError as exc:
+        print(f"错误，{exc}", file=sys.stderr)
+        sys.exit(2)
 
 import polars as pl
 
 from statstools.logging_utils import configure_logging
-from statstools.phenotype_utils import read_trait_phenotype, phenotype_means
+from statstools.phenotype_utils import matched_population_reference
+from statstools.effect_batches import iter_window_batches, write_part, consolidate_parts
 
 logger = logging.getLogger(__name__)
 
@@ -35,57 +47,6 @@ SUMMARY_COLUMNS = [
     "female_mean", "female_sd", "female_count",
 ]
 MIN_GROUP_SIZE = 3
-
-
-def matched_population_reference(
-    pheno_path: Path,
-    genotype_path: Path,
-    trait_id: int,
-) -> tuple[dict[str, float], dict[str, int], str]:
-    """Use the same unique phenotype/genotype intersection as f2aggregation."""
-    if not genotype_path.is_file():
-        raise ValueError(f"基因型文件不存在 {genotype_path}")
-    phenotype = read_trait_phenotype(pheno_path, trait_id)
-    genotype_scan = pl.scan_parquet(genotype_path)
-    missing = {"f2", "sex"} - set(genotype_scan.collect_schema().names())
-    if missing:
-        raise ValueError(f"基因型输入缺少必要列 {sorted(missing)}")
-    individual_sex = (
-        genotype_scan.select(["f2", "sex"])
-        .unique()
-        .group_by("f2")
-        .agg([
-            pl.col("sex").n_unique().alias("sex_count"),
-            pl.col("sex").first().alias("sex"),
-        ])
-        .collect(engine="streaming")
-    )
-    conflicts = individual_sex.filter(pl.col("sex_count") != 1)
-    if conflicts.height:
-        examples = conflicts.get_column("f2").head(5).to_list()
-        raise ValueError(f"同一个体存在多个性别编码。个体示例 {examples}")
-    invalid_sex = individual_sex.filter(
-        pl.col("sex").is_null() | ~pl.col("sex").is_in([1, 2])
-    )
-    if invalid_sex.height:
-        examples = invalid_sex.select(["f2", "sex"]).head(5).rows()
-        raise ValueError(f"性别编码必须为 1 或 2。异常示例 {examples}")
-    sex_by_id = dict(zip(
-        individual_sex.get_column("f2").to_list(),
-        individual_sex.get_column("sex").to_list(),
-    ))
-    phenotype_ids = set(phenotype["f2"].tolist())
-    matched_ids = phenotype_ids & set(sex_by_id)
-    logger.info("  有效表型个体数 %s", len(phenotype_ids))
-    logger.info("  基因型个体数 %s", len(sex_by_id))
-    logger.info("  成功匹配基因型的个体数 %s", len(matched_ids))
-    logger.info("  没有基因型而被排除的表型个体数 %s", len(phenotype_ids - matched_ids))
-    if not matched_ids:
-        raise ValueError("指定性状没有任何个体能够匹配基因型数据")
-    phenotype = phenotype.loc[phenotype["f2"].isin(matched_ids)].copy()
-    phenotype["sex"] = phenotype["f2"].map(sex_by_id)
-    means, counts, _ = phenotype_means(phenotype)
-    return means, counts, "基因型文件的 sex 列"
 
 
 def validate_input(schema: pl.Schema) -> None:
@@ -255,11 +216,10 @@ def population_long_result(result: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def write_result(result: pl.LazyFrame, output_path: Path) -> None:
-    if output_path.exists():
-        output_path.unlink()
-    population_long_result(result).sink_parquet(
-        output_path, compression="zstd", maintain_order=True,
-    )
+    with tempfile.TemporaryDirectory(prefix=".f2ahf_write_", dir=output_path.parent) as directory:
+        temporary = Path(directory) / "result.parquet"
+        write_part(population_long_result(result), temporary)
+        temporary.replace(output_path)
 
 
 def report_result(label: str, output_path: Path) -> None:
@@ -292,11 +252,21 @@ def main() -> None:
     )
     parser.add_argument("-o", "--output", required=True, help="输出目录")
     parser.add_argument("--trait_id", required=True, type=int, help="本次分析的性状编号")
+    parser.add_argument("-t", "--threads", type=int, default=None,
+                        help="Polars 线程数，默认使用进程全部可见核心")
+    parser.add_argument("--window_batch_size", type=int, default=32,
+                        help="每批 A 窗口数，默认 32；更小通常减少峰值内存")
     args = parser.parse_args()
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads 必须为正整数")
+    if args.window_batch_size < 1:
+        parser.error("--window_batch_size 必须为正整数")
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
     configure_logging(output_dir, "f2ahf", f"trait{args.trait_id}")
+    logger.info("当前进程可见核心数 %s；Polars 实际线程数 %s",
+                _visible_cpu_count(), pl.thread_pool_size())
 
     if not input_path.exists():
         logger.error("输入文件不存在 %s", input_path)
@@ -304,17 +274,6 @@ def main() -> None:
     try:
         data = pl.scan_parquet(input_path)
         validate_input(data.collect_schema())
-        trait_ids = (
-            data.select(pl.col("trait_id").unique())
-            .collect(engine="streaming")
-            .get_column("trait_id")
-            .to_list()
-        )
-        if trait_ids != [args.trait_id]:
-            raise ValueError(
-                f"输入文件中的 trait_id 为 {sorted(trait_ids)}，与参数 {args.trait_id} 不一致"
-            )
-
         pheno_path = Path(args.pheno)
         if not pheno_path.is_file():
             raise ValueError(f"表型文件不存在 {pheno_path}")
@@ -330,24 +289,31 @@ def main() -> None:
             if population_counts[population] == 0:
                 logger.warning("  %s 群体人数为零，标准化 delta_n 记为空；保留原始人数差", population)
 
-        paternal = build_flip_result(
-            data, "paternal", "allelea",
-            ["peerallelea", "alleleb", "peeralleleb"],
-            population_means,
-            population_counts,
-        )
-        maternal = build_flip_result(
-            data, "maternal", "peerallelea",
-            ["allelea", "alleleb", "peeralleleb"],
-            population_means,
-            population_counts,
-        )
+        data = data.select(WINDOW_KEYS + GENO_CODES + ["trait_id"] + SUMMARY_COLUMNS)
         paternal_path = output_dir / f"trait_{args.trait_id}_paternal.parquet"
         maternal_path = output_dir / f"trait_{args.trait_id}_maternal.parquet"
-
         started = time.time()
-        write_result(paternal, paternal_path)
-        write_result(maternal, maternal_path)
+        # Both routes are computed from the same bounded input batch, sequentially.
+        with tempfile.TemporaryDirectory(prefix=".f2ahf_parts_", dir=output_dir) as directory:
+            temporary = Path(directory)
+            parts = {"paternal": [], "maternal": []}
+            for index, frame in iter_window_batches(data, args.trait_id, args.window_batch_size):
+                for route, flipped, fixed in (
+                    ("paternal", "allelea", ["peerallelea", "alleleb", "peeralleleb"]),
+                    ("maternal", "peerallelea", ["allelea", "alleleb", "peeralleleb"]),
+                ):
+                    part = temporary / f"{route}_{index:06d}.parquet"
+                    result = build_flip_result(frame.lazy(), route, flipped, fixed,
+                                               population_means, population_counts)
+                    write_part(population_long_result(result), part)
+                    parts[route].append(part)
+                    del result
+                del frame
+            # Finish both temporary outputs before replacing either existing file.
+            for route in parts:
+                consolidate_parts(parts[route], temporary / f"{route}.parquet")
+            (temporary / "paternal.parquet").replace(paternal_path)
+            (temporary / "maternal.parquet").replace(maternal_path)
         logger.info("翻转计算完成，耗时 %.1f 秒", time.time() - started)
         report_result("父本", paternal_path)
         report_result("母本", maternal_path)

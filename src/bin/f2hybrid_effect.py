@@ -11,14 +11,24 @@ import math
 import os
 import sys
 import time
+import tempfile
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
+from statstools import _configure_polars_threads
+
+# Configure the native thread pool before importing Polars, also for direct execution.
+if __name__ == "__main__":
+    try:
+        _configure_polars_threads(sys.argv[1:])
+    except ValueError as exc:
+        print(f"错误，{exc}", file=sys.stderr)
+        sys.exit(2)
+
 import polars as pl
 
 from statstools.logging_utils import configure_logging
-from statstools.phenotype_utils import read_trait_phenotype, phenotype_means
+from statstools.phenotype_utils import matched_population_reference
+from statstools.effect_batches import iter_window_batches, write_part, consolidate_parts
 
 logger = logging.getLogger(__name__)
 
@@ -30,66 +40,12 @@ SUMMARY_COLUMNS = [
     "female_mean", "female_sd", "female_count", "female_z_mean", "female_z_sd",
 ]
 MIN_GROUP_SIZE = 3
-REQUIRED_PHENO_COLUMNS = {"f2", "trait_id", "trait_value"}
-EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm"}
-TEXT_SUFFIXES = {".txt", ".md", ".tsv"}
 
 POPULATIONS = [
     ("all", "mean", "sd", "count", "z_mean", "z_sd"),
     ("male", "male_mean", "male_sd", "male_count", "male_z_mean", "male_z_sd"),
     ("female", "female_mean", "female_sd", "female_count", "female_z_mean", "female_z_sd"),
 ]
-
-
-def matched_population_reference(
-    pheno_path: Path,
-    genotype_path: Path,
-    trait_id: int,
-) -> tuple[dict[str, float], dict[str, int], str]:
-    """Use the same unique phenotype/genotype intersection as f2aggregation."""
-    if not genotype_path.is_file():
-        raise ValueError(f"基因型文件不存在 {genotype_path}")
-    phenotype = read_trait_phenotype(pheno_path, trait_id)
-    genotype_scan = pl.scan_parquet(genotype_path)
-    missing = {"f2", "sex"} - set(genotype_scan.collect_schema().names())
-    if missing:
-        raise ValueError(f"基因型输入缺少必要列 {sorted(missing)}")
-    individual_sex = (
-        genotype_scan.select(["f2", "sex"])
-        .unique()
-        .group_by("f2")
-        .agg([
-            pl.col("sex").n_unique().alias("sex_count"),
-            pl.col("sex").first().alias("sex"),
-        ])
-        .collect(engine="streaming")
-    )
-    conflicts = individual_sex.filter(pl.col("sex_count") != 1)
-    if conflicts.height:
-        examples = conflicts.get_column("f2").head(5).to_list()
-        raise ValueError(f"同一个体存在多个性别编码。个体示例 {examples}")
-    invalid_sex = individual_sex.filter(
-        pl.col("sex").is_null() | ~pl.col("sex").is_in([1, 2])
-    )
-    if invalid_sex.height:
-        examples = invalid_sex.select(["f2", "sex"]).head(5).rows()
-        raise ValueError(f"性别编码必须为 1 或 2。异常示例 {examples}")
-    sex_by_id = dict(zip(
-        individual_sex.get_column("f2").to_list(),
-        individual_sex.get_column("sex").to_list(),
-    ))
-    phenotype_ids = set(phenotype["f2"].tolist())
-    matched_ids = phenotype_ids & set(sex_by_id)
-    logger.info("  有效表型个体数 %s", len(phenotype_ids))
-    logger.info("  基因型个体数 %s", len(sex_by_id))
-    logger.info("  成功匹配基因型的个体数 %s", len(matched_ids))
-    logger.info("  没有基因型而被排除的表型个体数 %s", len(phenotype_ids - matched_ids))
-    if not matched_ids:
-        raise ValueError("指定性状没有任何个体能够匹配基因型数据")
-    phenotype = phenotype.loc[phenotype["f2"].isin(matched_ids)].copy()
-    phenotype["sex"] = phenotype["f2"].map(sex_by_id)
-    means, counts, _ = phenotype_means(phenotype)
-    return means, counts, "基因型文件的 sex 列"
 
 
 def validate_input(schema: pl.Schema) -> None:
@@ -282,7 +238,7 @@ def build_hybrid_effects(
     return result.select(output_columns).sort(sort_columns)
 
 
-def report_result(output_path: Path) -> None:
+def report_result(output_path: Path, n_pairs: int | None = None) -> None:
     counts = (
         pl.scan_parquet(output_path)
         .select([
@@ -290,7 +246,8 @@ def report_result(output_path: Path) -> None:
             pl.col("hybrid_effect_z").is_not_null().sum().alias("valid"),
             pl.col("hybrid_effect_cond").is_not_null().sum().alias("valid_cond"),
             (pl.col("status") != "valid").sum().alias("invalid"),
-            pl.struct(WINDOW_KEYS).n_unique().alias("pairs"),
+            (pl.struct(WINDOW_KEYS).n_unique() if n_pairs is None
+             else pl.lit(n_pairs)).alias("pairs"),
         ])
         .collect(engine="streaming")
         .row(0, named=True)
@@ -319,7 +276,11 @@ def main() -> int:
         "-t", "--threads", type=int, default=None,
         help="Polars 线程数，默认使用当前节点全部可见核心",
     )
+    parser.add_argument("--window_batch_size", type=int, default=32,
+                        help="每批 A 窗口数，默认 32；更小通常减少峰值内存")
     args = parser.parse_args()
+    if args.window_batch_size < 1:
+        parser.error("--window_batch_size 必须为正整数")
     if args.threads is not None and args.threads < 1:
         parser.error("--threads 必须为正整数")
 
@@ -337,17 +298,6 @@ def main() -> int:
             raise ValueError(f"输入文件不存在 {input_path}")
         data = pl.scan_parquet(input_path)
         validate_input(data.collect_schema())
-        trait_ids = (
-            data.select(pl.col("trait_id").unique())
-            .collect(engine="streaming")
-            .get_column("trait_id")
-            .to_list()
-        )
-        if trait_ids != [args.trait_id]:
-            raise ValueError(
-                f"输入文件中的 trait_id 为 {sorted(trait_ids)}，与参数 {args.trait_id} 不一致"
-            )
-
         pheno_path = Path(args.pheno)
         if not pheno_path.is_file():
             raise ValueError(f"表型文件不存在 {pheno_path}")
@@ -366,17 +316,23 @@ def main() -> int:
 
         logger.info("开始计算 trait_id=%s，最小组内样本量=%s", args.trait_id, MIN_GROUP_SIZE)
         started = time.time()
-        result_path = output_dir / f"trait_{args.trait_id}_hybrid_effect.result.tmp.parquet"
-        try:
-            build_hybrid_effects(data, population_means).sink_parquet(
-                result_path, compression="zstd", maintain_order=True
-            )
-            os.replace(result_path, output_path)
-            logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
-            report_result(output_path)
-            return 0
-        finally:
-            result_path.unlink(missing_ok=True)
+        data = data.select(WINDOW_KEYS + GENOTYPE_COLUMNS + ["trait_id"] + SUMMARY_COLUMNS)
+        n_pairs = 0
+        with tempfile.TemporaryDirectory(prefix=".f2hybrid_parts_", dir=output_dir) as directory:
+            temporary = Path(directory)
+            parts = []
+            for index, frame in iter_window_batches(data, args.trait_id, args.window_batch_size):
+                n_pairs += frame.select(WINDOW_KEYS).n_unique()
+                part = temporary / f"part_{index:06d}.parquet"
+                write_part(build_hybrid_effects(frame.lazy(), population_means), part)
+                parts.append(part)
+                del frame
+            result_path = temporary / "result.parquet"
+            consolidate_parts(parts, result_path)
+            result_path.replace(output_path)
+        logger.info("计算完成，耗时 %.1f 秒", time.time() - started)
+        report_result(output_path, n_pairs=n_pairs)
+        return 0
     except Exception as exc:
         logger.exception("处理失败 %s", exc)
         return 1

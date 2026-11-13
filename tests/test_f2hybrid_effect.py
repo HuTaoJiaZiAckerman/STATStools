@@ -145,7 +145,7 @@ class StandardizationTests(unittest.TestCase):
 
 class HybridEffectTests(unittest.TestCase):
     def test_one_ab_pair_produces_48_comparisons(self):
-        result = hybrid.build_hybrid_effects(aggregation_rows().lazy()).collect()
+        result = hybrid.build_hybrid_effects(aggregation_rows().lazy(), {"all": 20.0, "male": 21.0, "female": 19.0}).collect()
         self.assertEqual(result.height, 48)
         self.assertEqual(
             set(result["population"].unique().to_list()),
@@ -166,7 +166,7 @@ class HybridEffectTests(unittest.TestCase):
             "b_state", "a_homo_state", "a_hetero_state",
             "homo_mean", "homo_sd", "homo_count", "homo_z_mean", "homo_z_sd",
             "hetero_mean", "hetero_sd", "hetero_count", "hetero_z_mean", "hetero_z_sd",
-            "hybrid_effect_raw", "hybrid_effect_z", "status",
+            "hybrid_effect_raw", "hybrid_effect_z", "hybrid_effect_cond", "status",
         ])
         sort_columns = [
             "chra", "windowa", "chrb", "windowb",
@@ -175,7 +175,7 @@ class HybridEffectTests(unittest.TestCase):
         self.assertTrue(result.equals(result.sort(sort_columns)))
 
     def test_effect_is_homozygote_minus_heterozygote(self):
-        result = hybrid.build_hybrid_effects(aggregation_rows().lazy()).collect()
+        result = hybrid.build_hybrid_effects(aggregation_rows().lazy(), {"all": 20.0, "male": 21.0, "female": 19.0}).collect()
         row = result.filter(
             (pl.col("b_state") == "11")
             & (pl.col("a_homo_state") == "00")
@@ -199,7 +199,7 @@ class HybridEffectTests(unittest.TestCase):
                 & (pl.col("peeralleleb") == 1)
             )
         )
-        result = hybrid.build_hybrid_effects(data.lazy()).collect()
+        result = hybrid.build_hybrid_effects(data.lazy(), {"all": 20.0, "male": 21.0, "female": 19.0}).collect()
         row = result.filter(
             (pl.col("b_state") == "11")
             & (pl.col("a_homo_state") == "00")
@@ -249,14 +249,15 @@ class HybridEffectTests(unittest.TestCase):
             pl.DataFrame(genotype_rows).write_parquet(genotype)
             frame = pd.DataFrame(phenotype_rows)
             aggregation.aggregate_trait(genotype, frame, 7, source)
-            genotype.unlink()
+            pheno = root / "phenotype.tsv"
+            frame.to_csv(pheno, sep="\t", index=False)
             output.mkdir()
             pl.DataFrame({"p_value": [1.0]}).write_parquet(
                 output / "trait_7_hybrid_effect.parquet"
             )
             original_argv = sys.argv
             sys.argv = [
-                "f2hybrid_effect", "-i", str(source),
+                "f2hybrid_effect", "-i", str(source), "-p", str(pheno), "-g", str(genotype),
                 "-o", str(output), "--trait_id", "7",
             ]
             try:
@@ -269,7 +270,7 @@ class HybridEffectTests(unittest.TestCase):
             self.assertTrue(result_path.exists())
             result = pl.read_parquet(result_path)
             self.assertEqual(result.height, 48)
-            self.assertEqual(result.width, 22)
+            self.assertEqual(result.width, 23)
             self.assertNotIn("p_value", result.columns)
             self.assertNotIn("q_value", result.columns)
             row = result.filter(

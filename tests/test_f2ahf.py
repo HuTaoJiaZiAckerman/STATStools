@@ -9,7 +9,6 @@ import tempfile
 import unittest
 
 import numpy as np
-import pandas as pd
 import polars as pl
 
 
@@ -41,12 +40,12 @@ def individual_data():
                     "chrb": b, "windowb": 0, "allelea": p, "peerallelea": m,
                     "alleleb": bp, "peeralleleb": bm,
                 })
-    return pl.DataFrame(genotype), pd.DataFrame(phenotype)
+    return pl.DataFrame(genotype), pl.DataFrame(phenotype)
 
 
 def aggregate_rows(ids=None):
     genotype, phenotype = individual_data()
-    joined = genotype.join(pl.from_pandas(phenotype), on="f2")
+    joined = genotype.join(phenotype, on="f2")
     if ids is not None:
         joined = joined.filter(pl.col("f2").is_in(ids))
     keys = ahf.WINDOW_KEYS + ahf.GENO_CODES + ["trait_id"]
@@ -80,6 +79,10 @@ def result(data, route="paternal", means=None, counts=None):
         data.lazy(), route, flipped, fixed, means or MEANS,
         COUNTS if counts is None else counts,
     ).collect()
+
+
+def identity_sort():
+    return ahf.WINDOW_KEYS + ahf.GENO_CODES + ["population"]
 
 
 class AhfTests(unittest.TestCase):
@@ -136,13 +139,13 @@ class AhfTests(unittest.TestCase):
 
     def test_population_reader_filters_trait_duplicates_and_uses_explicit_sex(self):
         from statstools.phenotype_utils import read_trait_phenotype, phenotype_means
-        data = pd.DataFrame({
+        data = pl.DataFrame({
             "f2": [1, 2, 1, 3, 3, 4], "trait_id": [21, 21, 21, 21, 21, 99],
-            "trait_value": [10, 20, 999, np.nan, 30, 1000], "sex": [2, 1, 2, 1, 1, 2],
+            "trait_value": [10.0, 20.0, 999.0, np.nan, 30.0, 1000.0], "sex": [2, 1, 2, 1, 1, 2],
         })
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "phenotype.tsv"
-            data.to_csv(path, sep="\t", index=False)
+            data.write_csv(path, separator="\t")
             means, counts, source = phenotype_means(read_trait_phenotype(path, 21))
         self.assertEqual(means, {"all": 20, "male": 25, "female": 10})
         self.assertEqual(counts, {"all": 3, "male": 2, "female": 1})
@@ -150,9 +153,9 @@ class AhfTests(unittest.TestCase):
 
     def test_count_effect_uses_trait_population_not_local_background_size(self):
         from statstools.phenotype_utils import phenotype_means
-        phenotype = individual_data()[1].iloc[:22].copy()
+        phenotype = individual_data()[1].head(22)
         means, counts, _ = phenotype_means(phenotype)
-        data = aggregate_rows(phenotype.f2.tolist())
+        data = aggregate_rows(phenotype["f2"].to_list())
         for route, anchor in [("paternal", "peerallelea"), ("maternal", "allelea")]:
             row = result(data, route, means, counts).filter(
                 (pl.col("chra") == 1) & (pl.col(anchor) == 1)
@@ -169,9 +172,9 @@ class AhfTests(unittest.TestCase):
 
     def test_count_effect_is_invariant_to_proportional_population_replication(self):
         from statstools.phenotype_utils import phenotype_means
-        phenotype = individual_data()[1].iloc[:22].copy()
+        phenotype = individual_data()[1].head(22)
         means, counts, _ = phenotype_means(phenotype)
-        data = aggregate_rows(phenotype.f2.tolist())
+        data = aggregate_rows(phenotype["f2"].to_list())
         scaled = data.with_columns([pl.col(name) * 2 for name in ("count", "male_count", "female_count")])
         for route in ("paternal", "maternal"):
             before = result(data, route, means, counts)
@@ -269,18 +272,20 @@ class AhfTests(unittest.TestCase):
             root = Path(directory)
             source, pheno = root / "aggregation.parquet", root / "phenotype.tsv"
             aggregate_rows().write_parquet(source)
-            individual_data()[1].to_csv(pheno, sep="\t", index=False)
+            individual_data()[1].write_csv(pheno, separator="\t")
+            genotype = root / "genotype.parquet"
+            individual_data()[0].write_parquet(genotype)
             command = [sys.executable, str(ROOT / "src/bin/f2ahf.py"), "-i", str(source), "-o", str(root), "--trait_id", "21"]
             missing = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(missing.returncode, 2)
-            run = subprocess.run(command + ["-p", str(pheno)], capture_output=True, text=True)
+            run = subprocess.run(command + ["-p", str(pheno), "-g", str(genotype)], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             for route in ("paternal", "maternal"):
                 rows = pl.read_parquet(root / f"trait_21_{route}.parquet")
                 expected = ahf.population_long_result(
                     result(aggregate_rows(), route).lazy()
                 ).collect()
-                self.assertTrue(rows.equals(expected))
+                self.assertTrue(rows.sort(identity_sort()).equals(expected.sort(identity_sort())))
                 ahf.report_result(route, root / f"trait_21_{route}.parquet")
 
 
