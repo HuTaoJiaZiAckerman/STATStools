@@ -4,6 +4,8 @@
 
 分两步运行：第一步每个性状单独计算，输出窗口分类及待校正的性状小表；第二步只读取各性状小表，完成跨性状 P 值校正及性状分类。不同性状的 AHF 数据从不合并。
 
+核心计算全部改为 Polars：扫描、父母本连接、分组聚合、λ、置换统计量、BH 校正和 Parquet 输出。程序不再使用 SQLite 配对索引，也不直接依赖 PyArrow、NumPy 或 pandas 执行计算。Python 只负责参数、日志、批次调度和随机交换编码。
+
 ## 输入与比较单位
 
 输入为 `f2ahf` 输出的 paternal 和 maternal Parquet，不需要原始表型文件或个体基因型文件。只使用 `delta_m`，不使用 `delta_f`，不按旧 P 值筛选。
@@ -58,6 +60,8 @@ T_t=\log(\lambda_{M,t}/\lambda_{P,t}).
 
 以同一性状/population 的全部有效 A 的 B 染色体并集定义 k 个共同区块。若全部 `2^k` 种标签组合不超过 `--n_permutations`，则共同精确枚举；否则共同随机置换指定次数。精确 P 值为极端组合比例，随机 P 值为 `(extreme+1)/(n_permutations+1)`。某个 A 未覆盖的 B 染色体贡献为零，不会增加该 A 的有效信息。有限区块数限制了最小 P 值，增加 A–B 记录数不能消除该限制。
 
+置换按 `--permutation_batch_size` 分批。每轮只生成一个共享交换编码，以 Polars 连接 B 染色体贡献，再按统计量和置换编号聚合；不一次展开全部置换。随机编码使用标准库 `random.getrandbits`，按 seed、trait_id、population 初始化；改变输入顺序或两个分批参数不会改变固定种子的随机方案。与旧版 NumPy 随机序列不同，因此相同数字 seed 的 Monte Carlo P 值可能略有变化；点估计和精确检验应一致。编码支持最多 63 条背景染色体，本研究的 18 条常染色体在支持范围内。
+
 两个检验层级分别校正：
 
 | 层级 | BH 校正范围 |
@@ -90,6 +94,9 @@ statstools f2large_effect_identify \
     --population all male female \
     --n_permutations 9999 \
     --seed 42 \
+    --threads 72 \
+    --window_batch_size 32 \
+    --permutation_batch_size 64 \
     -o /path/to/large_effect
 ```
 
@@ -99,6 +106,7 @@ statstools f2large_effect_identify \
 statstools f2large_effect_identify \
     --trait_summaries '/path/to/large_effect/trait_*_large_effect_summary.parquet' \
     --population all male female \
+    --threads 72 \
     -o /path/to/trait_classification
 ```
 
@@ -114,10 +122,17 @@ statstools f2large_effect_identify \
 | `--n_permutations` | 默认 9999；同一性状/population 的共享随机次数或共同精确枚举的预算 |
 | `--seed` | 默认 42，非负随机种子 |
 | `--alpha` | 默认 0.05；单性状模式用于窗口分类，汇总模式用于性状分类 |
-| `--batch_size` | 默认 32768，每批输入行数 |
-| `--temp_dir` | 临时磁盘目录，默认输出目录；必须已有目录且空间充足 |
+| `--threads` | 默认当前进程可见核心数；请求超过可见值时取可见值 |
+| `--window_batch_size` | 默认 32，每批配对的 A 窗口数 |
+| `--permutation_batch_size` | 默认 64，每批共享置换的轮数 |
 
-旧命令的 `-i`、`-p`、`--effect_column` 和 `--threads` 不适用于新工具。新版不需要个体表，默认长表群体由 `--population` 选择。脚本文件名由 STATStools 自动发现，无须新增命令注册表。
+旧命令的 `-i`、`-p`、`--effect_column` 不适用于新工具。SQLite 版本的 `--batch_size`、`--temp_dir` 已移除，改用上述两个分批参数。新版不需要个体表，默认长表群体由 `--population` 选择。脚本文件名由 STATStools 自动发现。
+
+## 线程初始化
+
+统一入口会在导入工具和 Polars 之前设置线程池；直接执行脚本也在导入 Polars 前读取 `--threads`。日志分别记录请求线程数、进程可见核心数和 `pl.thread_pool_size()` 实际值。线程数受调度器/cpuset 可见资源约束，例如作业仅分配 16 核时，请求 72 会使用 16。
+
+Polars 线程池不能在已初始化的同一进程内调整。交互式 Python 若先导入并使用了 Polars，再调用 main，工具会报告实际值与请求不一致；应在新进程中通过命令行运行。磁盘 I/O、任务大小和内存带宽可能限制利用率，线程数生效不保证全程所有核心满载。
 
 ## 输出与资源使用
 
@@ -149,6 +164,12 @@ permutation_method, n_permutations, seed, alpha, fdr_scope, n_traits_tested
 
 第二步输出 `traits_large_effect.parquet`，保留每个性状独立计算的 λ、T 和 P 值，仅增加跨性状 q 值、检验数和最终状态。无需重读 AHF 文件。方法、权重和版本标记写入各表 Parquet metadata。
 
-程序逐批读取必要列，使用标准库 SQLite 在磁盘建立配对索引，页缓存约 64 MiB；不会先纵向展开或在内存整体连接两份大表。还需要输入批次和 A×B 染色体汇总的内存，因此不是固定总内存保证。临时索引可能较大，应优先使用空间充足的本地 scratch；磁盘索引以额外 I/O 换取较低的配对内存，未对真实 HPC 大数据进行性能评测。索引在处理完成或异常后清理。
+程序先扫描少量坐标列发现 A 窗口，再按染色体及 `window_batch_size` 个实际 A 窗口分批。每批通过 Parquet 坐标统计跳过无关行组，仅读取必要列；读取后统一整数位宽、验证重复键，以 Polars 连接和聚合。后续只保留 A×B 染色体的小型贡献表。缺失窗口索引不补齐，也不把最大索引当作窗口数。
+
+没有大型磁盘索引，但分批并不保证固定总内存。输入配对内存取决于每批 A 的背景记录数；置换内存取决于每批轮数和有效 A×B 染色体数。内存不足时降低对应分批参数；内存充裕时可增大以减少调度开销。若输入行组没有按 A 集中排列、缺少可用统计信息，行组跳过效率会降低，可能重复读取较多数据。
+
+临时目录仅用于写出最终 Parquet 后重命名，内容为小型结果表，不是输入数据索引。输入输出字段及两层权重、检验和分类规则保持不变。
+
+本次在本地 Polars 2.1.0、20 个可见核心的环境验证。单次小规模对照为每条路径 102,400 条构造记录、64 个 A、8 条背景染色体、256 种精确交换：旧版约 0.725 秒/峰值 RSS 200 MiB，Polars 单线程约 0.155 秒/122 MiB，Polars 4 线程约 0.084 秒/123 MiB。点估计、精确 P 值、BH q 值、计数及分类与旧版一致。这只是本地小规模验证，不代表超算大文件的吞吐或加速比例；没有安装/升级依赖，也未核验超算的 Polars 版本。
 
 默认拒绝覆盖已有结果。输入文件不修改。一个总体 LPE 性状可以包含 LME 窗口；性状判定不是显著窗口多数投票。现有窗口原型输出不包含新版性状小表，应按本版本重新计算后再执行性状汇总校正。

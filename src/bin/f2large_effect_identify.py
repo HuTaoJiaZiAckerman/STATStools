@@ -1,356 +1,372 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按性状和焦点窗口比较父母本 AHF 的 λ，识别 LPE 与 LME。
-
-Only matched, finite long-format delta_m records are used. All B states and
-anchor states are pooled with equal record weights. Permutations swap the two
-routes jointly within each B chromosome, conditional on the observed cohort.
-All focal windows of one trait/population share each permutation. Trait-level
-effects give each testable window equal weight; their P values are corrected
-across traits in a separate summary mode.
-The null requires blockwise route-label exchangeability, not just equal means.
-"""
+"""使用 Polars 多线程计算窗口及性状的父母本 λ、共享区块置换和 LPE/LME。"""
 
 import argparse
 import glob
 import logging
-import math
-import sqlite3
+from pathlib import Path
+import random
 import sys
 import tempfile
 import time
-from pathlib import Path
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
-
+from statstools import _configure_polars_threads, _visible_cpu_count
 from statstools.logging_utils import configure_logging
 
+# Direct execution, like the dispatcher, must configure the pool before import.
+if __name__ == "__main__":
+    try:
+        _configure_polars_threads(sys.argv[1:])
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        sys.exit(2)
+
+import polars as pl
 
 logger = logging.getLogger(__name__)
-KEYS = ["chra", "windowa", "population", "chrb", "windowb", "b_state", "anchor_state"]
+A_KEYS = ["chra", "windowa", "population"]
+KEYS = A_KEYS + ["chrb", "windowb", "b_state", "anchor_state"]
 INTEGER_COLUMNS = ["chra", "windowa", "chrb", "windowb", "trait_id", "anchor_state"]
-POPULATIONS = {"all": 0, "male": 1, "female": 2}
-OUTPUT_SCHEMA = pa.schema([
-    ("trait_id", pa.int64()), ("chra", pa.int64()), ("windowa", pa.int64()),
-    ("population", pa.string()), ("n_paternal", pa.int64()),
-    ("n_maternal", pa.int64()), ("n_paired", pa.int64()),
-    ("n_b_window", pa.int64()), ("n_blocks", pa.int64()),
-    ("n_permutation_blocks", pa.int64()),
-    ("mean_effect_paternal", pa.float64()), ("mean_effect_maternal", pa.float64()),
-    ("lambda_paternal", pa.float64()), ("lambda_maternal", pa.float64()),
-    ("T", pa.float64()), ("p_value", pa.float64()), ("q_value", pa.float64()),
-    ("status", pa.string()), ("reason", pa.string()),
-    ("permutation_method", pa.string()), ("n_permutations", pa.int64()),
-    ("seed", pa.int64()), ("alpha", pa.float64()),
-    ("fdr_scope", pa.string()),
-])
-SUMMARY_SCHEMA = pa.schema([
-    ("trait_id", pa.int64()), ("population", pa.string()),
-    ("n_windows", pa.int64()), ("n_windows_used", pa.int64()),
-    ("n_paired", pa.int64()), ("n_blocks", pa.int64()),
-    ("n_permutation_blocks", pa.int64()),
-    ("mean_effect_paternal", pa.float64()), ("mean_effect_maternal", pa.float64()),
-    ("lambda_paternal", pa.float64()), ("lambda_maternal", pa.float64()),
-    ("T", pa.float64()), ("p_value", pa.float64()), ("q_value", pa.float64()),
-    ("status", pa.string()), ("reason", pa.string()),
-    ("permutation_method", pa.string()), ("n_permutations", pa.int64()),
-    ("seed", pa.int64()), ("alpha", pa.float64()), ("fdr_scope", pa.string()),
-    ("n_traits_tested", pa.int64()),
-])
-DEFINITION = b"v2_equal_records_within_windows_equal_testable_windows_within_traits"
+POPULATIONS = ("all", "male", "female")
+DEFINITION = "v2_equal_records_within_windows_equal_testable_windows_within_traits"
+ESTIMATES = {
+    "mean_effect_paternal": pl.Float64, "mean_effect_maternal": pl.Float64,
+    "lambda_paternal": pl.Float64, "lambda_maternal": pl.Float64,
+    "T": pl.Float64, "p_value": pl.Float64, "q_value": pl.Float64,
+    "status": pl.String, "reason": pl.String,
+    "permutation_method": pl.String, "n_permutations": pl.Int64,
+    "seed": pl.Int64, "alpha": pl.Float64, "fdr_scope": pl.String,
+}
+OUTPUT_SCHEMA = {
+    "trait_id": pl.Int64, "chra": pl.Int64, "windowa": pl.Int64,
+    "population": pl.String, "n_paternal": pl.Int64, "n_maternal": pl.Int64,
+    "n_paired": pl.Int64, "n_b_window": pl.Int64, "n_blocks": pl.Int64,
+    "n_permutation_blocks": pl.Int64, **ESTIMATES,
+}
+SUMMARY_SCHEMA = {
+    "trait_id": pl.Int64, "population": pl.String,
+    "n_windows": pl.Int64, "n_windows_used": pl.Int64,
+    "n_paired": pl.Int64, "n_blocks": pl.Int64,
+    "n_permutation_blocks": pl.Int64, **ESTIMATES, "n_traits_tested": pl.Int64,
+}
+BLOCK_SCHEMA = {
+    **{name: OUTPUT_SCHEMA[name] for name in A_KEYS},
+    "chrb": pl.Int64, "n": pl.Int64, "n_b_window": pl.Int64,
+    "sum_paternal": pl.Float64, "sum_maternal": pl.Float64,
+}
 
 
-def create_database(path):
-    """Keep the large pairing index on disk, with a bounded SQLite page cache."""
-    db = sqlite3.connect(path)
-    db.execute("PRAGMA journal_mode=OFF")
-    db.execute("PRAGMA synchronous=OFF")
-    db.execute("PRAGMA temp_store=FILE")
-    db.execute("PRAGMA cache_size=-65536")
-    db.execute("""CREATE TABLE effects (
-        chra INTEGER NOT NULL, windowa INTEGER NOT NULL,
-        chrb INTEGER NOT NULL, windowb INTEGER NOT NULL,
-        population TEXT NOT NULL, b_state TEXT NOT NULL,
-        anchor_state INTEGER NOT NULL,
-        paternal REAL, maternal REAL,
-        has_paternal INTEGER NOT NULL DEFAULT 0,
-        has_maternal INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (chra, windowa, population, chrb, windowb, b_state, anchor_state)
-    ) WITHOUT ROWID""")
-    return db
+def conform(frame, schema):
+    return frame.select([
+        pl.col(name).cast(dtype) if name in frame.columns else pl.lit(None, dtype=dtype).alias(name)
+        for name, dtype in schema.items()
+    ])
 
 
-def ingest_route(db, path, route, trait_id, populations, batch_size):
-    """Read only necessary columns; reject duplicate contexts instead of multiplying joins."""
-    source = pq.ParquetFile(path)
+def any_rows(frame, condition):
+    return bool(frame.select(condition.fill_null(True).any()).item()) if frame.height else False
+
+
+def route_scan(path, trait_id):
+    scan = pl.scan_parquet(path, hive_partitioning=False, low_memory=True)
+    schema = scan.collect_schema()
     required = set(KEYS + ["trait_id", "flip_type", "delta_m"])
-    missing = required - set(source.schema_arrow.names)
+    missing = required - set(schema.names())
     if missing:
         raise ValueError(f"{path} 缺少新版 AHF 长表字段 {sorted(missing)}")
     for name in INTEGER_COLUMNS:
-        if not pa.types.is_integer(source.schema_arrow.field(name).type):
+        if not schema[name].is_integer():
             raise ValueError(f"{path} 的 {name} 必须为整数列")
     needed = KEYS + ["trait_id", "flip_type", "delta_m"]
-    if "population_mean" in source.schema_arrow.names:
+    if "population_mean" in schema:
         needed.append("population_mean")
-    columns = ", ".join(KEYS)
-    placeholders = ", ".join("?" for _ in KEYS)
-    statement = f"""INSERT INTO effects ({columns}, {route}, has_{route})
-        VALUES ({placeholders}, ?, 1)
-        ON CONFLICT ({columns}) DO UPDATE SET
-            {route}=excluded.{route}, has_{route}=1
-        WHERE effects.has_{route}=0"""
-    references = {}
-    selected = 0
-    started = last_report = time.monotonic()
-    for batch in source.iter_batches(batch_size=batch_size, columns=needed):
-        data = batch.to_pydict()
-        rows = []
-        for index, current_trait in enumerate(data["trait_id"]):
-            if current_trait != trait_id:
-                continue
-            pop = data["population"][index]
-            if pop not in POPULATIONS:
-                raise ValueError(f"{path} 的 population 非法：{pop!r}")
-            if pop not in populations:
-                continue
-            if data["flip_type"][index] != route:
-                raise ValueError(f"{path} 包含与参数不一致的 flip_type")
-            key = tuple(data[name][index] for name in KEYS)
-            if any(value is None for value in key):
-                raise ValueError(f"{path} 的配对键含缺失值")
-            a, wa, _, b, wb, state, anchor = key
-            if a <= 0 or b <= 0 or wa < 0 or wb < 0 or a == b:
-                raise ValueError(f"要求染色体为正整数、窗口非负且 A/B 跨染色体：{key}")
-            if state not in ("00", "01", "10", "11") or anchor not in (0, 1):
-                raise ValueError(f"b_state 必须为两位字符串，anchor_state 必须为 0/1：{key}")
-            value = data["delta_m"][index]
-            if value is not None:
-                value = float(value)
-                if not math.isfinite(value):
-                    value = None
-            if value is not None and "population_mean" in data:
-                reference = data["population_mean"][index]
-                if reference is None or not math.isfinite(reference) or reference == 0:
-                    raise ValueError(f"{path} 的有效 delta_m 对应无效 population_mean")
-                if pop in references and not math.isclose(
-                    reference, references[pop], rel_tol=1e-10, abs_tol=1e-12
-                ):
-                    raise ValueError(f"{path} 中同一性状/{pop} 的标准化分母不一致")
-                references[pop] = reference
-            rows.append(key + (value,))
-        if rows:
-            cursor = db.executemany(statement, rows)
-            if cursor.rowcount != len(rows):
-                raise ValueError(f"{path} 的 {route} 存在重复配对键；请先去除重复输入")
-            db.commit()
-            selected += len(rows)
-        now = time.monotonic()
-        if now - last_report >= 60:
-            logger.info("%s 已写入配对索引 %s 行", route, f"{selected:,}")
-            last_report = now
-    if not selected:
-        raise ValueError(f"{path} 没有 trait_id={trait_id} 且属于所选 population 的记录")
-    logger.info("%s 输入 %s 行，耗时 %.1f 秒", route, f"{selected:,}", time.monotonic() - started)
-    return references
+    # Keep raw coordinate columns until after batch filtering, so Parquet
+    # statistics can prune row groups without predicates on cast expressions.
+    return scan.filter(pl.col("trait_id") == trait_id).select(needed)
 
 
-def summarize_windows(db):
-    """Reduce matched records to small A-by-B-chromosome sums and counts."""
-    windows = {}
-    for a, wa, pop, n_p, n_m in db.execute("""
-        SELECT chra, windowa, population,
-               SUM(paternal IS NOT NULL), SUM(maternal IS NOT NULL)
-        FROM effects GROUP BY chra, windowa, population
-        ORDER BY chra, windowa, population
-    """):
-        windows[(a, wa, pop)] = {
-            "n_paternal": n_p, "n_maternal": n_m, "blocks": [],
-        }
-    for a, wa, pop, b, n, n_b, sum_p, sum_m in db.execute("""
-        SELECT chra, windowa, population, chrb, COUNT(*),
-               COUNT(DISTINCT windowb), SUM(ABS(paternal)), SUM(ABS(maternal))
-        FROM effects WHERE paternal IS NOT NULL AND maternal IS NOT NULL
-        GROUP BY chra, windowa, population, chrb
-        ORDER BY chra, windowa, population, chrb
-    """):
-        windows[(a, wa, pop)]["blocks"].append((b, n, n_b, sum_p, sum_m))
-    return windows
+def normalize(frame):
+    expressions = []
+    for name in frame.columns:
+        dtype = pl.Int64 if name in INTEGER_COLUMNS else (
+            pl.Float64 if name in ("delta_m", "population_mean") else pl.String
+        )
+        expressions.append(pl.col(name).cast(dtype))
+    return frame.select(expressions)
 
 
-def joint_block_permutation(differences, permutations, seed):
-    """Use identical B-chromosome swaps for every window and the trait statistic.
+def validate_batch(data, route):
+    invalid = (
+        pl.any_horizontal([pl.col(name).is_null() for name in KEYS])
+        | (pl.col("chra") <= 0) | (pl.col("chrb") <= 0)
+        | (pl.col("windowa") < 0) | (pl.col("windowb") < 0)
+        | (pl.col("chra") == pl.col("chrb"))
+        | ~pl.col("b_state").is_in(["00", "01", "10", "11"])
+        | ~pl.col("anchor_state").is_in([0, 1])
+        | (pl.col("flip_type") != route) | pl.col("flip_type").is_null()
+    )
+    if any_rows(data, invalid):
+        raise ValueError(f"{route} 含无效配对键、祖源状态或传递路径；A/B 须跨染色体")
+    if any_rows(data, pl.struct(KEYS).is_duplicated()):
+        raise ValueError(f"{route} 存在重复配对键；请先去除重复输入")
+    if "population_mean" not in data.columns:
+        return None
+    valid = data.filter(pl.col("delta_m").is_finite())
+    if any_rows(valid, ~pl.col("population_mean").is_finite() | (pl.col("population_mean") == 0)):
+        raise ValueError(f"{route} 的有效 delta_m 对应无效 population_mean")
+    return valid.group_by("population").agg(
+        pl.col("population_mean").min().alias("ref_min"),
+        pl.col("population_mean").max().alias("ref_max"),
+    )
 
-    Each row is one statistic's P-minus-M contribution per B chromosome. Its
-    P+M total stays fixed, so |sum(P-M)| and |log(lambda_M/lambda_P)| have the
-    same ordering. The trait row uses equal-window-weighted contributions.
-    """
-    differences = np.asarray(differences, dtype=np.float64)
-    if differences.ndim != 2 or not np.isfinite(differences).all():
-        raise ValueError("置换贡献必须为有限的二维数组")
-    scales = np.max(np.abs(differences), axis=1, keepdims=True)
-    differences = np.divide(differences, scales, out=np.zeros_like(differences), where=scales > 0)
-    observed = np.abs(differences.sum(axis=1))
-    tolerance = 1e-12 * np.maximum(1.0, np.abs(differences).sum(axis=1))
-    blocks = differences.shape[1]
-    exact = blocks < 63 and (1 << blocks) <= permutations
-    total = (1 << blocks) if exact else permutations
-    rng = np.random.default_rng(seed)
-    extreme = np.zeros(differences.shape[0], dtype=np.int64)
+
+def pair_batch(paternal, maternal):
+    counts = []
+    for data, route in ((paternal, "paternal"), (maternal, "maternal")):
+        counts.append(data.group_by(A_KEYS).agg(
+            pl.col("delta_m").is_finite().fill_null(False).sum().cast(pl.Int64).alias(f"n_{route}")
+        ))
+    totals = counts[0].join(counts[1], on=A_KEYS, how="full", coalesce=True).with_columns(
+        pl.col("n_paternal", "n_maternal").fill_null(0)
+    )
+    p = paternal.filter(pl.col("delta_m").is_finite()).select(*KEYS, pl.col("delta_m").abs().alias("paternal"))
+    m = maternal.filter(pl.col("delta_m").is_finite()).select(*KEYS, pl.col("delta_m").abs().alias("maternal"))
+    blocks = p.join(m, on=KEYS, how="inner").group_by(A_KEYS + ["chrb"]).agg(
+        pl.len().cast(pl.Int64).alias("n"),
+        pl.col("windowb").n_unique().cast(pl.Int64).alias("n_b_window"),
+        pl.col("paternal").sum().alias("sum_paternal"),
+        pl.col("maternal").sum().alias("sum_maternal"),
+    )
+    return totals, blocks
+
+
+def load_pair_summaries(paternal_path, maternal_path, trait_id, populations, window_batch_size):
+    scans = [route_scan(path, trait_id) for path in (paternal_path, maternal_path)]
+    inventories = [normalize(scan.select(A_KEYS).unique().collect(engine="streaming")) for scan in scans]
+    for inventory, route in zip(inventories, ("paternal", "maternal")):
+        if any_rows(inventory, ~pl.col("population").is_in(POPULATIONS)):
+            raise ValueError(f"{route} 包含非法 population")
+        if any_rows(inventory, pl.col("chra").is_null() | pl.col("windowa").is_null()
+                    | (pl.col("chra") <= 0) | (pl.col("windowa") < 0)):
+            raise ValueError(f"{route} 的 A 坐标无效")
+        if inventory.filter(pl.col("population").is_in(populations)).is_empty():
+            raise ValueError(f"{route} 没有本性状所选 population 的记录")
+    inventory = pl.concat(inventories).filter(pl.col("population").is_in(populations)).unique()
+    missing = set(populations) - set(inventory["population"].to_list())
+    if missing:
+        raise ValueError(f"输入缺少 population：{sorted(missing)}")
+    scans = [scan.filter(pl.col("population").is_in(populations)) for scan in scans]
+    coordinates = inventory.select("chra", "windowa").unique().sort("chra", "windowa")
+    count_frames, block_frames, references = [], [], []
+    completed = 0
+    for chromosome in coordinates.partition_by("chra", maintain_order=True):
+        chrom = chromosome["chra"][0]
+        windows = chromosome["windowa"].to_list()
+        for start in range(0, len(windows), window_batch_size):
+            selected = windows[start:start + window_batch_size]
+            condition = (pl.col("chra") == chrom) & pl.col("windowa").is_between(selected[0], selected[-1])
+            started = time.monotonic()
+            data = [normalize(scan.filter(condition).collect(engine="streaming")) for scan in scans]
+            for frame, route in zip(data, ("paternal", "maternal")):
+                reference = validate_batch(frame, route)
+                if reference is not None and reference.height:
+                    references.append(reference)
+            counts, blocks = pair_batch(*data)
+            count_frames.append(counts)
+            block_frames.append(blocks)
+            completed += len(selected)
+            logger.info("A 配对 %s/%s：chr%s window %s–%s；P/M 行数 %s/%s；耗时 %.2f 秒",
+                        completed, coordinates.height, chrom, selected[0], selected[-1],
+                        data[0].height, data[1].height, time.monotonic() - started)
+            del data
+    if references:
+        reference = pl.concat(references).group_by("population").agg(
+            pl.col("ref_min").min(), pl.col("ref_max").max(),
+        )
+        tolerance = 1e-12 + 1e-10 * pl.max_horizontal(pl.col("ref_min").abs(), pl.col("ref_max").abs())
+        if any_rows(reference, pl.col("ref_max") - pl.col("ref_min") > tolerance):
+            raise ValueError("同一性状/population 内或父母本之间的 population_mean 不一致")
+    return pl.concat(count_frames), pl.concat(block_frames)
+
+
+def with_estimates(frame):
+    expressions = []
+    for route in ("paternal", "maternal"):
+        mean = pl.col(f"mean_effect_{route}")
+        rate = 1.0 / mean
+        expressions.append(pl.when(mean.is_finite() & (mean > 0) & rate.is_finite())
+                           .then(rate).otherwise(None).alias(f"lambda_{route}"))
+    return frame.with_columns(expressions).with_columns(
+        pl.when(pl.col("lambda_paternal").is_not_null() & pl.col("lambda_maternal").is_not_null())
+        .then(pl.col("mean_effect_paternal").log() - pl.col("mean_effect_maternal").log())
+        .otherwise(None).alias("T")
+    )
+
+
+def classify(frame, alpha):
+    return frame.with_columns(
+        pl.lit(alpha).alias("alpha"),
+        pl.when((pl.col("q_value") < alpha) & (pl.col("T") > 0)).then(pl.lit("LPE"))
+        .when((pl.col("q_value") < alpha) & (pl.col("T") < 0)).then(pl.lit("LME"))
+        .when(pl.col("q_value").is_not_null()).then(pl.lit("unresolved"))
+        .otherwise(pl.col("status")).alias("status"),
+    )
+
+
+def adjust_bh(frame, groups=("population",)):
+    groups = list(groups)
+    original = frame.drop("q_value", strict=False).with_row_index("_bh_id")
+    valid = original.filter(pl.col("p_value").is_finite()).sort(groups + ["p_value", "_bh_id"])
+    ranked = valid.with_columns(
+        pl.col("p_value").cum_count().over(groups).cast(pl.Float64).alias("_rank"),
+        pl.len().over(groups).cast(pl.Float64).alias("_tests"),
+    ).with_columns((pl.col("p_value") * pl.col("_tests") / pl.col("_rank")).alias("_raw"))
+    adjusted = ranked.with_columns(pl.col("_raw").cum_min(reverse=True).over(groups).clip(0, 1).alias("q_value"))
+    return original.join(adjusted.select("_bh_id", "q_value"), on="_bh_id", how="left").sort("_bh_id").drop("_bh_id")
+
+
+def joint_block_permutation(contributions, permutations, seed, batch_size):
+    block_map = contributions.select("chrb").unique().sort("chrb").with_row_index("_block")
+    k = block_map.height
+    if k > 63:
+        raise ValueError("当前随机编码支持最多 63 条背景染色体；本研究为 18 条常染色体")
+    block_map = block_map.with_columns(pl.lit(2, dtype=pl.UInt64).pow(pl.col("_block")).alias("_bit"))
+    exact = (1 << k) <= permutations
+    total = (1 << k) if exact else permutations
+    rng = random.Random(seed)
+    normalized = contributions.with_columns(pl.col("difference").abs().max().over("_stat_id").alias("_scale"))
+    normalized = normalized.with_columns(
+        pl.when(pl.col("_scale") > 0).then(pl.col("difference") / pl.col("_scale"))
+        .otherwise(0.0).alias("difference")
+    ).select("_stat_id", "chrb", "difference")
+    thresholds = normalized.group_by("_stat_id").agg(
+        pl.col("difference").sum().abs().alias("_observed"),
+        pl.col("difference").abs().sum().alias("_l1"),
+    ).with_columns((pl.col("_observed") - 1e-12 * pl.max_horizontal(pl.lit(1.0), pl.col("_l1"))).alias("_cutoff"))
+    counts = []
     last_report = time.monotonic()
-    for start in range(0, total, 512):
-        size = min(512, total - start)
-        if exact:
-            codes = np.arange(start, start + size, dtype=np.uint64)
-            bits = ((codes[:, None] >> np.arange(blocks, dtype=np.uint64)) & 1).astype(np.int8)
-        else:
-            bits = rng.integers(0, 2, size=(size, blocks), dtype=np.int8)
-        permuted = np.einsum("bk,sk->bs", 2 * bits - 1, differences, optimize=False)
-        extreme += np.count_nonzero(np.abs(permuted) >= observed - tolerance, axis=0)
+    for start in range(0, total, batch_size):
+        size = min(batch_size, total - start)
+        codes = range(start, start + size) if exact else [rng.getrandbits(k) for _ in range(size)]
+        draws = pl.DataFrame({"_perm": range(start, start + size), "_code": codes},
+                             schema={"_perm": pl.Int64, "_code": pl.UInt64})
+        signs = draws.join(block_map, how="cross").select(
+            "_perm", "chrb", (((pl.col("_code") // pl.col("_bit")) % 2).cast(pl.Int8) * 2 - 1).alias("_sign")
+        )
+        scores = normalized.join(signs, on="chrb", how="inner").group_by("_stat_id", "_perm").agg(
+            (pl.col("difference") * pl.col("_sign")).sum().abs().alias("_abs")
+        ).join(thresholds.select("_stat_id", "_cutoff"), on="_stat_id", how="left")
+        counts.append(scores.group_by("_stat_id").agg((pl.col("_abs") >= pl.col("_cutoff")).sum().cast(pl.Int64).alias("_extreme")))
         now = time.monotonic()
         if now - last_report >= 60:
-            logger.info("共享背景区块置换已完成 %s / %s 轮", start + size, total)
+            logger.info("Polars 共享区块置换 %s/%s 轮", start + size, total)
             last_report = now
-    p_value = extreme / total if exact else (extreme + 1) / (total + 1)
-    return p_value, total, "exact" if exact else "monte_carlo"
+    extremes = pl.concat(counts).group_by("_stat_id").agg(pl.col("_extreme").sum())
+    return extremes.select(
+        "_stat_id",
+        (pl.col("_extreme") / total if exact else (pl.col("_extreme") + 1) / (total + 1)).alias("p_value"),
+        pl.lit(total, dtype=pl.Int64).alias("n_permutations"),
+        pl.lit(k, dtype=pl.Int64).alias("n_permutation_blocks"),
+        pl.lit("exact" if exact else "monte_carlo").alias("permutation_method"),
+    )
 
 
-def adjust_bh(values):
-    """Return BH-adjusted values, preserving missing positions."""
-    p = np.asarray([np.nan if value is None else value for value in values], dtype=float)
-    adjusted = np.full(p.shape, np.nan)
-    valid = np.flatnonzero(np.isfinite(p))
-    if len(valid):
-        order = valid[np.argsort(p[valid], kind="stable")]
-        ranked = p[order] * len(order) / np.arange(1, len(order) + 1)
-        adjusted[order] = np.minimum(1.0, np.minimum.accumulate(ranked[::-1])[::-1])
-    return [float(value) if np.isfinite(value) else None for value in adjusted]
-
-
-def set_estimates(row, mean_p, mean_m):
-    """Fill the shared magnitude estimates; undefined finite lambdas stay missing."""
-    if not math.isfinite(mean_p) or not math.isfinite(mean_m):
-        row["reason"] = "nonfinite_mean_effect"
-        return False
-    row["mean_effect_paternal"] = mean_p
-    row["mean_effect_maternal"] = mean_m
-    lambda_p = 1 / mean_p if mean_p > 0 else None
-    lambda_m = 1 / mean_m if mean_m > 0 else None
-    row["lambda_paternal"] = lambda_p if lambda_p is not None and math.isfinite(lambda_p) else None
-    row["lambda_maternal"] = lambda_m if lambda_m is not None and math.isfinite(lambda_m) else None
-    if row["lambda_paternal"] is None or row["lambda_maternal"] is None:
-        row["reason"] = "nonpositive_or_unrepresentable_mean"
-        return False
-    row["T"] = math.log(mean_p) - math.log(mean_m)
-    return True
-
-
-def classify(row, q, alpha):
-    row["q_value"] = q
-    row["alpha"] = alpha
-    if q is not None:
-        row["status"] = "unresolved"
-        if q < alpha:
-            if row["T"] > 0:
-                row["status"] = "LPE"
-            elif row["T"] < 0:
-                row["status"] = "LME"
-
-
-def identify_effects(windows, trait_id, permutations, seed, alpha):
-    """Analyze each population independently, sharing swaps across all its A windows."""
-    results = []
-    for (a, wa, pop), data in sorted(windows.items()):
-        blocks = data["blocks"]
-        n = sum(block[1] for block in blocks)
-        row = dict.fromkeys(OUTPUT_SCHEMA.names)
-        row.update(
-            trait_id=trait_id, chra=a, windowa=wa, population=pop,
-            n_paternal=data["n_paternal"], n_maternal=data["n_maternal"],
-            n_paired=n, n_b_window=sum(block[2] for block in blocks),
-            n_blocks=len(blocks), status="insufficient", reason="no_matched_effects",
-            permutation_method="not_tested", n_permutations=0, n_permutation_blocks=0, seed=seed,
-            alpha=alpha, fdr_scope="within_trait_population_windows",
-        )
-        if n:
-            if any(not math.isfinite(block[3]) or not math.isfinite(block[4]) for block in blocks):
-                row["reason"] = "nonfinite_effect_sum"
-            else:
-                mean_p = math.fsum(block[3] / n for block in blocks)
-                mean_m = math.fsum(block[4] / n for block in blocks)
-                if set_estimates(row, mean_p, mean_m):
-                    if len(blocks) < 2:
-                        row["reason"] = "fewer_than_two_background_chromosomes"
-                    else:
-                        row.update(status="unresolved", reason=None)
-        results.append(row)
-
-    summaries = []
-    for pop in POPULATIONS:
-        indexes = [i for i, row in enumerate(results) if row["population"] == pop]
-        if not indexes:
+def identify_effects(counts, blocks, trait_id, permutations, seed, alpha, permutation_batch_size=64):
+    totals = blocks.group_by(A_KEYS).agg(
+        pl.col("n").sum().alias("n_paired"), pl.col("n_b_window").sum(),
+        pl.len().cast(pl.Int64).alias("n_blocks"),
+        (~pl.col("sum_paternal").is_finite() | ~pl.col("sum_maternal").is_finite()).any().alias("_bad_sum"),
+    )
+    contributions = blocks.join(totals.select(*A_KEYS, "n_paired"), on=A_KEYS, how="left").with_columns(
+        (pl.col("sum_paternal") / pl.col("n_paired")).alias("_p"),
+        (pl.col("sum_maternal") / pl.col("n_paired")).alias("_m"),
+    )
+    means = contributions.group_by(A_KEYS).agg(
+        pl.col("_p").sum().alias("mean_effect_paternal"),
+        pl.col("_m").sum().alias("mean_effect_maternal"),
+    )
+    results = counts.join(totals, on=A_KEYS, how="left").join(means, on=A_KEYS, how="left").with_columns(
+        pl.col("n_paired", "n_b_window", "n_blocks").fill_null(0),
+        pl.col("_bad_sum").fill_null(False),
+    ).sort(A_KEYS).with_row_index("_stat_id").with_columns(pl.col("_stat_id").cast(pl.Int64))
+    results = with_estimates(results).with_columns(
+        pl.when(pl.col("n_paired") == 0).then(pl.lit("no_matched_effects"))
+        .when(pl.col("_bad_sum")).then(pl.lit("nonfinite_effect_sum"))
+        .when(pl.col("T").is_null()).then(pl.lit("nonpositive_or_unrepresentable_mean"))
+        .when(pl.col("n_blocks") < 2).then(pl.lit("fewer_than_two_background_chromosomes"))
+        .otherwise(None).alias("reason"),
+        pl.lit(trait_id, dtype=pl.Int64).alias("trait_id"),
+        pl.lit(seed, dtype=pl.Int64).alias("seed"), pl.lit(alpha).alias("alpha"),
+        pl.lit("within_trait_population_windows").alias("fdr_scope"),
+    ).with_columns(
+        pl.when(pl.col("reason").is_null()).then(pl.lit("unresolved"))
+        .otherwise(pl.lit("insufficient")).alias("status")
+    )
+    summaries, p_frames = [], []
+    for pop_index, pop in enumerate(POPULATIONS):
+        part = results.filter(pl.col("population") == pop)
+        if part.is_empty():
             continue
-        eligible = [i for i in indexes if results[i]["status"] == "unresolved"]
-        summary = dict.fromkeys(SUMMARY_SCHEMA.names)
-        summary.update(
-            trait_id=trait_id, population=pop, n_windows=len(indexes),
-            n_windows_used=len(eligible), n_paired=sum(results[i]["n_paired"] for i in eligible),
-            n_blocks=0, n_permutation_blocks=0, status="insufficient", reason="no_testable_windows",
-            permutation_method="not_tested", n_permutations=0, seed=seed, alpha=alpha,
-            fdr_scope="across_traits_within_population_pending",
-        )
-        if eligible:
-            block_ids = sorted({
-                block[0] for i in eligible
-                for block in windows[(results[i]["chra"], results[i]["windowa"], pop)]["blocks"]
-            })
-            block_index = {value: index for index, value in enumerate(block_ids)}
-            p_means = np.zeros((len(eligible), len(block_ids)), dtype=float)
-            m_means = np.zeros_like(p_means)
-            for target, index in enumerate(eligible):
-                row = results[index]
-                for b, _, _, sum_p, sum_m in windows[(row["chra"], row["windowa"], pop)]["blocks"]:
-                    p_means[target, block_index[b]] = sum_p / row["n_paired"]
-                    m_means[target, block_index[b]] = sum_m / row["n_paired"]
-            # Divide before summing to avoid overweighting windows with more pairs.
-            trait_p = (p_means / len(eligible)).sum(axis=0)
-            trait_m = (m_means / len(eligible)).sum(axis=0)
-            summary.update(n_blocks=len(block_ids), n_permutation_blocks=len(block_ids))
-            trait_testable = set_estimates(summary, math.fsum(trait_p), math.fsum(trait_m))
-            differences = p_means - m_means
-            if trait_testable:
-                differences = np.vstack([differences, trait_p - trait_m])
-            random_seed = np.random.SeedSequence([seed, trait_id, POPULATIONS[pop]])
-            logger.info("trait_id=%s population=%s：%s 个 A 共享 %s 条 B 染色体的置换", trait_id, pop, len(eligible), len(block_ids))
-            p_values, count, method = joint_block_permutation(differences, permutations, random_seed)
-            for index, p_value in zip(eligible, p_values[:len(eligible)]):
-                results[index].update(p_value=float(p_value), n_permutations=count,
-                                      n_permutation_blocks=len(block_ids), permutation_method=method)
-            if trait_testable:
-                summary.update(p_value=float(p_values[-1]), n_permutations=count,
-                               permutation_method=method, status="pending_correction", reason=None)
-        adjusted = adjust_bh([results[i]["p_value"] for i in indexes])
-        for index, q in zip(indexes, adjusted):
-            classify(results[index], q, alpha)
-        summaries.append(summary)
-    return results, summaries
+        eligible = part.filter(pl.col("reason").is_null())
+        summary = conform(pl.DataFrame({
+            "trait_id": [trait_id], "population": [pop], "n_windows": [part.height],
+            "n_windows_used": [eligible.height], "n_paired": [eligible["n_paired"].sum()],
+            "n_blocks": [0], "seed": [seed], "alpha": [alpha],
+            "status": ["insufficient"], "reason": ["no_testable_windows"],
+            "fdr_scope": ["across_traits_within_population_pending"],
+        }), SUMMARY_SCHEMA).with_columns(pl.lit(results.height + pop_index, dtype=pl.Int64).alias("_stat_id"))
+        if eligible.height:
+            win_contrib = contributions.join(eligible.select(*A_KEYS, "_stat_id"), on=A_KEYS, how="inner")
+            # Missing B chromosomes in an A have zero contribution: divide by
+            # ALL eligible windows, rather than averaging only present rows.
+            trait_contrib = win_contrib.group_by("chrb").agg(
+                (pl.col("_p").sum() / eligible.height).alias("_p"),
+                (pl.col("_m").sum() / eligible.height).alias("_m"),
+            )
+            trait_means = trait_contrib.select(
+                pl.col("_p").sum().alias("mean_effect_paternal"),
+                pl.col("_m").sum().alias("mean_effect_maternal"),
+            )
+            summary = summary.drop("mean_effect_paternal", "mean_effect_maternal", "lambda_paternal", "lambda_maternal", "T").hstack(trait_means)
+            summary = with_estimates(summary).with_columns(pl.lit(trait_contrib.height, dtype=pl.Int64).alias("n_blocks"))
+            summary = summary.with_columns(
+                pl.when(pl.col("T").is_not_null()).then(pl.lit("pending_correction"))
+                .otherwise(pl.lit("insufficient")).alias("status"),
+                pl.when(pl.col("T").is_not_null()).then(pl.lit(None, dtype=pl.String))
+                .otherwise(pl.lit("nonpositive_or_unrepresentable_mean")).alias("reason"),
+            )
+            differences = win_contrib.select("_stat_id", "chrb", (pl.col("_p") - pl.col("_m")).alias("difference"))
+            if summary["T"][0] is not None:
+                differences = pl.concat([differences, trait_contrib.select(
+                    pl.lit(results.height + pop_index, dtype=pl.Int64).alias("_stat_id"),
+                    "chrb", (pl.col("_p") - pl.col("_m")).alias("difference"),
+                )])
+            logger.info("trait_id=%s population=%s：%s 个 A 共享 %s 条背景染色体置换", trait_id, pop, eligible.height, trait_contrib.height)
+            p_frames.append(joint_block_permutation(differences, permutations, f"{seed}:{trait_id}:{pop}", permutation_batch_size))
+        summaries.append(conform(summary, SUMMARY_SCHEMA).hstack(summary.select("_stat_id")))
+    p_schema = {"_stat_id": pl.Int64, "p_value": pl.Float64, "n_permutations": pl.Int64,
+                "n_permutation_blocks": pl.Int64, "permutation_method": pl.String}
+    p_info = pl.concat(p_frames) if p_frames else pl.DataFrame(schema=p_schema)
+    results = results.join(p_info, on="_stat_id", how="left").with_columns(
+        pl.col("n_permutations", "n_permutation_blocks").fill_null(0),
+        pl.col("permutation_method").fill_null("not_tested"),
+    )
+    results = classify(adjust_bh(results), alpha)
+    summary = pl.concat(summaries).drop("p_value", "n_permutations", "n_permutation_blocks", "permutation_method").join(
+        p_info, on="_stat_id", how="left"
+    ).with_columns(pl.col("n_permutations", "n_permutation_blocks").fill_null(0),
+                   pl.col("permutation_method").fill_null("not_tested"))
+    return conform(results, OUTPUT_SCHEMA), conform(summary, SUMMARY_SCHEMA).sort("trait_id", "population")
 
 
-def identify_windows(windows, trait_id, permutations, seed, alpha):
-    """Window-only view of the shared-permutation analysis."""
-    return identify_effects(windows, trait_id, permutations, seed, alpha)[0]
-
-
-def write_output(path, rows, schema, metadata):
-    """Write a completed table via a temporary file; refuse existing outputs."""
+def write_output(path, frame, schema, metadata):
+    path = Path(path)
     if path.exists():
         raise ValueError(f"输出已存在，请更换输出目录或先手动移走：{path}")
-    table = pa.Table.from_pylist(rows, schema=schema).replace_schema_metadata(metadata)
     with tempfile.TemporaryDirectory(prefix=".large_effect_write_", dir=path.parent) as temporary:
         temporary_path = Path(temporary) / "result.parquet"
-        pq.write_table(table, temporary_path, compression="zstd")
+        conform(frame, schema).write_parquet(temporary_path, compression="zstd", metadata=metadata)
         if path.exists():
             raise ValueError(f"输出已存在：{path}")
         temporary_path.replace(path)
@@ -368,166 +384,113 @@ def run_analysis(args):
     summary_path = output / f"trait_{args.trait_id}_large_effect_summary.parquet"
     for path in (destination, summary_path):
         if path.exists():
-            raise ValueError(f"输出已存在，请更换输出目录或先手动移走：{path}")
-    logger.info("按 trait_id、A 窗口、population 分组；b_state/anchor_state 记录等权合并")
-    logger.info("仅使用父母本共同有效的 delta_m；不使用 delta_f 或原始个体表型")
-    logger.info("置换单位为 B 染色体；零假设要求区块内父母本标签可交换")
-    logger.info("同一性状/population 的所有 A 与性状统计量共享每轮交换决定")
-    logger.info("BH 范围为单个性状、单个 population 的全部有效 A 窗口")
-    with tempfile.TemporaryDirectory(prefix="f2large_effect_", dir=args.temp_dir or output) as temporary:
-        database_path = Path(temporary) / "paired_effects.sqlite"
-        logger.info("临时磁盘索引 %s；SQLite 页缓存上限约 64 MiB", database_path)
-        db = create_database(database_path)
-        try:
-            references = [
-                ingest_route(db, path, route, args.trait_id, args.population, args.batch_size)
-                for path, route in zip(paths, ("paternal", "maternal"))
-            ]
-            for pop in references[0].keys() & references[1].keys():
-                if not math.isclose(references[0][pop], references[1][pop], rel_tol=1e-10, abs_tol=1e-12):
-                    raise ValueError(f"父母本 {pop} 的 population_mean 不一致")
-            windows = summarize_windows(db)
-        finally:
-            db.close()
-    missing_populations = set(args.population) - {key[2] for key in windows}
-    if missing_populations:
-        raise ValueError(f"输入没有所选 population 的记录：{sorted(missing_populations)}")
-    results, summaries = identify_effects(windows, args.trait_id, args.n_permutations, args.seed, args.alpha)
-    if not results:
-        raise ValueError("没有可输出的 A 窗口")
+            raise ValueError(f"输出已存在：{path}")
+    logger.info("Polars 配对聚合；每批 %s 个 A，置换每批 %s 轮；无 SQLite 磁盘索引",
+                args.window_batch_size, args.permutation_batch_size)
+    logger.info("固定性状/population；匹配 B、b_state、anchor；仅使用有限 delta_m，取绝对值后记录等权")
+    logger.info("窗口及性状共享每轮 B 染色体交换；性状按有效窗口等权；零假设要求区块标签可交换")
+    counts, blocks = load_pair_summaries(*paths, args.trait_id, args.population, args.window_batch_size)
+    results, summary = identify_effects(counts, blocks, args.trait_id, args.n_permutations,
+                                      args.seed, args.alpha, args.permutation_batch_size)
     metadata = {
-        b"definition": DEFINITION,
-        b"estimand": b"inverse mean absolute delta_m on common valid contexts",
-        b"null": b"route-label exchangeability within B-chromosome blocks",
-        b"inference": b"conditional on observed F2 cohort; no individual resampling",
-        b"permutations": b"shared across all eligible A windows and trait within trait_id/population",
-        b"requested_permutations": str(args.n_permutations).encode(),
+        "definition": DEFINITION, "engine": "polars", "polars_version": pl.__version__,
+        "threads": str(pl.thread_pool_size()), "rng": "python_random_getrandbits_v1",
+        "null": "route-label exchangeability within B-chromosome blocks",
+        "inference": "conditional on observed F2 cohort; no individual resampling",
+        "permutations": "shared across all eligible A windows and trait within trait_id/population",
+        "requested_permutations": str(args.n_permutations),
     }
     write_output(destination, results, OUTPUT_SCHEMA, {
-        **metadata, b"kind": b"window_results",
-        b"weights": b"equal matched records; all b_state and anchor_state pooled",
-        b"fdr_scope": b"within trait_id and population across A windows",
+        **metadata, "kind": "window_results", "weights": "equal matched records; all b_state and anchor_state pooled",
+        "fdr_scope": "within trait_id and population across A windows",
     })
-    write_output(summary_path, summaries, SUMMARY_SCHEMA, {
-        **metadata, b"kind": b"trait_summary",
-        b"weights": b"equal testable windows; no selection by window P or q",
-        b"fdr_scope": b"pending correction across traits within population",
+    write_output(summary_path, summary, SUMMARY_SCHEMA, {
+        **metadata, "kind": "trait_summary", "weights": "equal testable windows; no selection by window P or q",
+        "fdr_scope": "pending correction across traits within population",
     })
-    logger.info("输出 %s，共 %s 个窗口/population 结果", destination, len(results))
-    logger.info("输出 %s；性状状态待跨性状 BH 校正", summary_path)
-    for status in ("LPE", "LME", "unresolved", "insufficient"):
-        logger.info("%s：%s", status, sum(row["status"] == status for row in results))
+    logger.info("窗口输出 %s；性状待校正输出 %s", destination, summary_path)
+    logger.info("窗口分类 %s", results.group_by("status").len().sort("status").to_dicts())
 
 
 def run_correction(args):
-    """Read only small per-trait summaries and correct traits within each population."""
     destination = Path(args.output) / "traits_large_effect.parquet"
     if destination.exists():
-        raise ValueError(f"输出已存在，请更换输出目录或先手动移走：{destination}")
-    paths = []
-    seen_paths = set()
+        raise ValueError(f"输出已存在：{destination}")
+    paths, seen = [], set()
     for pattern in args.trait_summaries:
         matches = sorted(glob.glob(str(Path(pattern).expanduser())))
         if not matches:
             raise ValueError(f"未找到性状汇总文件：{pattern}")
         for match in matches:
             path = Path(match).resolve()
-            if path in seen_paths:
+            if path in seen:
                 raise ValueError(f"重复汇总文件：{path}")
-            if not path.is_file():
-                raise ValueError(f"汇总输入不是文件：{path}")
-            seen_paths.add(path)
+            seen.add(path)
             paths.append(path)
-    rows = []
-    seen_traits = set()
+    frames = []
     for path in paths:
-        source = pq.ParquetFile(path)
-        metadata = source.schema_arrow.metadata or {}
-        if metadata.get(b"kind") != b"trait_summary" or metadata.get(b"definition") != DEFINITION:
+        metadata = pl.read_parquet_metadata(path)
+        if metadata.get("kind") != "trait_summary" or metadata.get("definition") != DEFINITION:
             raise ValueError(f"{path} 不是当前定义下的待校正性状汇总文件")
-        missing = set(SUMMARY_SCHEMA.names) - set(source.schema_arrow.names)
+        frame = pl.read_parquet(path, hive_partitioning=False)
+        missing = set(SUMMARY_SCHEMA) - set(frame.columns)
         if missing:
             raise ValueError(f"{path} 缺少汇总字段 {sorted(missing)}")
-        for row in source.read(columns=SUMMARY_SCHEMA.names).to_pylist():
-            pop = row["population"]
-            if pop not in POPULATIONS:
-                raise ValueError(f"{path} 包含非法 population")
-            if pop not in args.population:
-                continue
-            trait = row["trait_id"]
-            if not isinstance(trait, int) or trait < 0:
-                raise ValueError(f"{path} 的 trait_id 必须为非负整数")
-            key = (trait, pop)
-            if key in seen_traits:
-                raise ValueError(f"重复的性状/population 汇总：{key}")
-            seen_traits.add(key)
-            p_value = row["p_value"]
-            if p_value is None:
-                if row["status"] != "insufficient":
-                    raise ValueError(f"{path} 的待校正记录缺少 P 值")
-            else:
-                if not math.isfinite(p_value) or not 0 <= p_value <= 1:
-                    raise ValueError(f"{path} 的 P 值必须在 [0,1] 内")
-                if row["T"] is None or not math.isfinite(row["T"]):
-                    raise ValueError(f"{path} 的有效检验缺少有限 T 值")
-                for route in ("paternal", "maternal"):
-                    mean = row[f"mean_effect_{route}"]
-                    rate = row[f"lambda_{route}"]
-                    if (mean is None or rate is None or not math.isfinite(mean)
-                            or not math.isfinite(rate) or mean <= 0 or rate <= 0
-                            or not math.isclose(mean * rate, 1.0, rel_tol=1e-10)):
-                        raise ValueError(f"{path} 的性状平均效应与 lambda 不一致")
-                expected_t = math.log(row["mean_effect_paternal"]) - math.log(row["mean_effect_maternal"])
-                if not math.isclose(row["T"], expected_t, rel_tol=1e-10, abs_tol=1e-12):
-                    raise ValueError(f"{path} 的 T 与父母本 lambda 方向不一致")
-                if row["status"] != "pending_correction":
-                    raise ValueError(f"{path} 包含已分类或非待校正记录")
-            rows.append(row)
-    if not rows:
+        if not frame.schema["trait_id"].is_integer() or any_rows(frame, ~pl.col("population").is_in(POPULATIONS)):
+            raise ValueError(f"{path} 的性状编号或 population 无效")
+        frames.append(conform(frame.filter(pl.col("population").is_in(args.population)), SUMMARY_SCHEMA))
+    frame = pl.concat(frames)
+    if frame.is_empty():
         raise ValueError("没有所选 population 的性状汇总记录")
-    missing_populations = set(args.population) - {row["population"] for row in rows}
-    if missing_populations:
-        raise ValueError(f"汇总输入缺少 population：{sorted(missing_populations)}")
-    rows.sort(key=lambda row: (row["trait_id"], POPULATIONS[row["population"]]))
-    for pop in POPULATIONS:
-        indexes = [i for i, row in enumerate(rows) if row["population"] == pop]
-        if not indexes:
-            continue
-        n_tested = sum(rows[i]["p_value"] is not None for i in indexes)
-        adjusted = adjust_bh([rows[i]["p_value"] for i in indexes])
-        for index, q in zip(indexes, adjusted):
-            row = rows[index]
-            classify(row, q, args.alpha)
-            row.update(fdr_scope="across_traits_within_population", n_traits_tested=n_tested)
-        logger.info("%s：%s 个性状汇总，其中 %s 个有效 P 值纳入 BH", pop, len(indexes), n_tested)
-    write_output(destination, rows, SUMMARY_SCHEMA, {
-        b"kind": b"traits_classified", b"definition": DEFINITION,
-        b"weights": b"equal testable windows within each trait; no cross-trait effect pooling",
-        b"fdr_scope": b"across input traits within population",
+    missing = set(args.population) - set(frame["population"].to_list())
+    if missing:
+        raise ValueError(f"汇总输入缺少 population：{sorted(missing)}")
+    if any_rows(frame, pl.col("trait_id").is_null() | (pl.col("trait_id") < 0)):
+        raise ValueError("trait_id 必须为非负整数")
+    if any_rows(frame, pl.struct("trait_id", "population").is_duplicated()):
+        raise ValueError("重复的性状/population 汇总")
+    absent = frame.filter(pl.col("p_value").is_null())
+    valid = frame.filter(pl.col("p_value").is_not_null())
+    if any_rows(absent, pl.col("status") != "insufficient"):
+        raise ValueError("待校正记录缺少 P 值")
+    if any_rows(valid, ~pl.col("p_value").is_finite() | ~pl.col("p_value").is_between(0, 1)
+                | ~pl.col("T").is_finite() | (pl.col("status") != "pending_correction")):
+        raise ValueError("性状汇总包含无效 P/T 值或非待校正状态")
+    for route in ("paternal", "maternal"):
+        mean, rate = pl.col(f"mean_effect_{route}"), pl.col(f"lambda_{route}")
+        if any_rows(valid, ~mean.is_finite() | ~rate.is_finite() | (mean <= 0) | (rate <= 0)
+                    | ((mean * rate - 1).abs() > 1e-10)):
+            raise ValueError("性状平均效应与 lambda 不一致")
+    expected = pl.col("mean_effect_paternal").log() - pl.col("mean_effect_maternal").log()
+    if any_rows(valid, (pl.col("T") - expected).abs() > 1e-12 + 1e-10 * expected.abs()):
+        raise ValueError("T 与父母本 lambda 方向不一致")
+    frame = classify(adjust_bh(frame), args.alpha).with_columns(
+        pl.col("p_value").count().over("population").cast(pl.Int64).alias("n_traits_tested"),
+        pl.lit("across_traits_within_population").alias("fdr_scope"),
+    ).sort("trait_id", "population")
+    write_output(destination, frame, SUMMARY_SCHEMA, {
+        "kind": "traits_classified", "definition": DEFINITION, "engine": "polars",
+        "weights": "equal testable windows within each trait; no cross-trait effect pooling",
+        "fdr_scope": "across input traits within population", "threads": str(pl.thread_pool_size()),
     })
-    logger.info("输出性状最终分类 %s", destination)
-
-
-def run(args):
-    if args.trait_summaries:
-        run_correction(args)
-    else:
-        run_analysis(args)
+    logger.info("性状最终分类 %s；校正范围 %s", destination,
+                frame.group_by("population").agg(pl.len().alias("n_traits"), pl.col("p_value").count().alias("n_tested")).to_dicts())
 
 
 def main():
-    parser = argparse.ArgumentParser(description="按窗口和性状比较父母本 λ，使用共享 B 染色体区块置换及分层 BH 识别 LPE/LME")
-    parser.add_argument("--paternal", help="单性状模式必填，新版长格式 paternal AHF Parquet")
-    parser.add_argument("--maternal", help="单性状模式必填，新版长格式 maternal AHF Parquet")
-    parser.add_argument("--trait_summaries", nargs="+", help="汇总模式：待校正性状小表，可给多个路径或引号包裹的通配符；不读取 AHF 大表")
+    parser = argparse.ArgumentParser(description="Polars 多线程计算窗口/性状 λ，共享背景区块置换及分层 BH 识别 LPE/LME")
+    parser.add_argument("--paternal", help="单性状模式必填，paternal AHF 长表")
+    parser.add_argument("--maternal", help="单性状模式必填，maternal AHF 长表")
+    parser.add_argument("--trait_id", type=int, help="单性状模式必填，性状编号")
+    parser.add_argument("--trait_summaries", nargs="+", help="汇总模式：性状小表路径或带引号通配符")
     parser.add_argument("-o", "--output", required=True, help="输出目录")
-    parser.add_argument("--trait_id", type=int, help="单性状模式必填，本次分析的性状编号")
-    parser.add_argument("--population", nargs="+", choices=list(POPULATIONS), default=["all"], help="所选群体；默认 all，可指定 all male female")
-    parser.add_argument("--n_permutations", type=int, default=9999, help="共享置换次数；全部背景染色体组合不超过此数则精确枚举，默认 9999")
-    parser.add_argument("--seed", type=int, default=42, help="非负随机种子，默认 42")
-    parser.add_argument("--alpha", type=float, default=0.05, help="BH 校正后显著性阈值，默认 0.05")
-    parser.add_argument("--batch_size", type=int, default=32768, help="输入 Parquet 每批读取行数，默认 32768")
-    parser.add_argument("--temp_dir", help="临时磁盘索引目录，默认输出目录；须有足够磁盘空间")
+    parser.add_argument("--population", nargs="+", choices=POPULATIONS, default=["all"])
+    parser.add_argument("--n_permutations", type=int, default=9999)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--threads", type=int, help="Polars 线程数，默认当前进程可见核心数")
+    parser.add_argument("--window_batch_size", type=int, default=32, help="每批 A 窗口数，默认 32")
+    parser.add_argument("--permutation_batch_size", type=int, default=64, help="每批共享置换轮数，默认 64")
     args = parser.parse_args()
     if args.trait_summaries:
         if args.paternal is not None or args.maternal is not None or args.trait_id is not None:
@@ -536,18 +499,28 @@ def main():
         parser.error("单性状模式必须提供 paternal、maternal 和 trait_id")
     if (args.trait_id is not None and not 0 <= args.trait_id < (1 << 63)) or not 0 <= args.seed < (1 << 63):
         parser.error("trait_id 和 seed 必须在非负 int64 范围内")
-    if args.n_permutations < 1 or args.batch_size < 1:
-        parser.error("n_permutations 和 batch_size 必须为正整数")
+    if min(args.n_permutations, args.window_batch_size, args.permutation_batch_size) < 1:
+        parser.error("置换次数和分批参数必须为正整数")
+    if args.threads is not None and args.threads < 1:
+        parser.error("threads 必须为正整数")
     if not 0 < args.alpha < 1:
         parser.error("alpha 必须在 0 和 1 之间")
-    if args.temp_dir and not Path(args.temp_dir).is_dir():
-        parser.error("temp_dir 必须为已存在的目录")
     label = "trait_correction" if args.trait_summaries else f"trait{args.trait_id}"
     configure_logging(args.output, "f2large_effect_identify", label)
+    visible = _visible_cpu_count()
+    requested = args.threads if args.threads is not None else visible
+    actual = pl.thread_pool_size()
+    logger.info("请求线程数 %s；当前进程可见核心数 %s；Polars 实际线程数 %s；Polars %s",
+                requested, visible, actual, pl.__version__)
+    if actual != min(requested, visible):
+        logger.warning("Polars 线程池已初始化，实际线程数与请求不一致；请在新进程中通过命令行运行")
     try:
         started = time.monotonic()
-        run(args)
-        logger.info("完成，耗时 %.1f 秒", time.monotonic() - started)
+        if args.trait_summaries:
+            run_correction(args)
+        else:
+            run_analysis(args)
+        logger.info("完成，耗时 %.2f 秒", time.monotonic() - started)
     except Exception:
         logger.exception("LPE/LME 判定失败")
         sys.exit(1)

@@ -196,7 +196,7 @@ class STATStools:
             print(f"可用工具：{', ' .join(self.tools.keys())}")
             return 1
         script_path = self.tools[tool_name]
-        if tool_name == "f2hybrid_effect":
+        if tool_name in {"f2hybrid_effect", "f2large_effect_identify"}:
             try:
                 _configure_polars_threads(args)
             except ValueError as exc:
