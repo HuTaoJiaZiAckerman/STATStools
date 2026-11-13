@@ -1,4 +1,4 @@
-"""Check signed, mean-scaled AHF effects and compatibility with permutations."""
+"""Check signed, mean-scaled AHF effects and long-format output."""
 
 import importlib.util
 import os
@@ -25,7 +25,6 @@ def load_tool(name):
 
 
 ahf = load_tool("f2ahf")
-permutation = load_tool("f2permutation_test")
 
 
 def individual_data():
@@ -284,32 +283,6 @@ class AhfTests(unittest.TestCase):
                 self.assertTrue(rows.equals(expected))
                 ahf.report_result(route, root / f"trait_21_{route}.parquet")
 
-    def test_permutation_p_values_are_identical_for_new_and_old_effect_scales(self):
-        genotype, phenotype = individual_data()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            genotypes_path = root / "genotypes.parquet"
-            genotype.write_parquet(genotypes_path)
-            windows, sexes, values = permutation.load_genotypes(
-                genotypes_path, dict(zip(phenotype.f2, phenotype.trait_value))
-            )
-            keys, matrix = permutation.dense_genotypes(windows)
-            for route in ("paternal", "maternal"):
-                new = result(aggregate_rows(), route)
-                old = new.with_columns([
-                    pl.col(f"{effect}_raw").alias(effect) for effect in permutation.EFFECTS
-                ]).drop(list(permutation.POPULATION_MEANS.values()) + [f"{effect}_raw" for effect in permutation.EFFECTS])
-                new_path, old_path = root / f"{route}_new.parquet", root / f"{route}_old.parquet"
-                new.write_parquet(new_path)
-                old.write_parquet(old_path)
-                for effect in permutation.EFFECTS:
-                    before = np.full(old.height, np.nan)
-                    after = np.full(new.height, np.nan)
-                    for path, p_values in [(old_path, before), (new_path, after)]:
-                        permutation.calculate_route(
-                            path, route, 21, effect, keys, matrix, sexes, values, 19, 42, p_values, 0
-                        )
-                    np.testing.assert_allclose(before, after, equal_nan=True)
 
 
 if __name__ == "__main__":

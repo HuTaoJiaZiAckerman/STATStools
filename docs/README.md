@@ -55,4 +55,5 @@ statstools show_parquet -h
 * [f2aggregation](f2aggregation.md)  将双窗口基因型组合与一个性状的观测值连接，并聚合原始与标准化表型统计量。
 * [f2hybrid_effect](f2hybrid_effect.md)  在固定背景窗口 B 的祖源状态后，计算焦点窗口 A 的纯合减杂合表型效应。
 * [f2ahf](f2ahf.md)  在匹配的局部遗传背景中分别计算父本和母本祖先单倍型的表型翻转效应与丰度翻转效应。
+* [f2large_effect_identify](f2large_effect_identify.md)  按窗口与性状估计父母本 λ，以共享背景染色体区块置换及分层 BH 识别 LPE/LME。
 * [trace_haplotype](trace_haplotype.md)  旧版 F2 单倍型来源追溯工具。
